@@ -5,7 +5,7 @@ import errno
 import os
 import socket
 import sys
-from typing import Any
+from typing import Any, override
 
 import uvicorn
 
@@ -21,12 +21,32 @@ PORT_TAKEN = frozenset({errno.EADDRINUSE, 10048})
 PAGE_RETURN_SECONDS = 10.0
 
 
+class QuietServer(uvicorn.Server):
+    """uvicorn, keeping house once a second instead of ten times.
+
+    uvicorn wakes every 0.1 s to refresh the Date header (once a second anyway) and to see
+    whether it was asked to stop. That was most of what an idle app did: ten wake-ups a
+    second, for as long as it was open. Here it looks once a second, so stopping takes up to
+    a second longer and nothing else changes; the counter steps by ten, so the header is
+    still refreshed on every look.
+    """
+
+    @override
+    async def main_loop(self) -> None:
+        counter = 0
+        should_exit = await self.on_tick(counter)
+        while not should_exit:
+            counter = (counter + 10) % 864000
+            await asyncio.sleep(1.0)
+            should_exit = await self.on_tick(counter)
+
+
 async def _serve() -> str | None:
     """Serve until the app is closed. Returns why it could not start, if it could not."""
     listening = _listen()
     from .main import app
 
-    server = uvicorn.Server(uvicorn.Config(app, host=HOST, port=PORT))
+    server = QuietServer(uvicorn.Config(app, host=HOST, port=PORT))
     # The one handle that can stop this process gracefully. Reached by the update route, which
     # has to close the app so the launcher can replace it while nothing holds the files open.
     app.state.server = server

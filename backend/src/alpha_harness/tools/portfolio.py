@@ -10,7 +10,6 @@ trading days, counting a day an Alpha did not trade as zero: once it has started
 keeps an equal share of capital whether or not its market was open.
 """
 
-import asyncio
 import itertools
 import math
 from bisect import bisect_left
@@ -20,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from .. import compute as heavy
 from ..vault import metrics
 
 if TYPE_CHECKING:
@@ -130,7 +130,7 @@ async def net_figures_of(
     for chunk in itertools.batched(dict.fromkeys(alpha_ids), NET_CHUNK, strict=False):
         series = await alphas.series(list(chunk))
         meta = await alphas.by_ids(list(series))
-        found |= await asyncio.to_thread(net_figures, series, meta, bps)
+        found |= await heavy.run(net_figures, series, meta, bps)
     return found
 
 

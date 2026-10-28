@@ -12,7 +12,6 @@ Only *finished* simulations count in the denominator. Counting queued work would
 every lab look worse the moment it was funded.
 """
 
-import asyncio
 import json
 import re
 from collections import Counter
@@ -22,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import structlog
 from sqlalchemy import select
 
+from .. import compute
 from ..brain.platform import (
     IGNORED_CHECKS,
     PLATFORM_ALPHA_URL,
@@ -232,7 +232,7 @@ async def submittable(
     # One read for both the ranking and the sparklines.
     days = await alphas.daily_pnl(list(dict.fromkeys(str(r["alpha_id"]) for r in [*held, *chosen])))
     order = stability_order(held)
-    picks = await asyncio.to_thread(
+    picks = await compute.run(
         independent,
         order,
         # One market here, so one region: the profile holds a single series.
@@ -381,7 +381,7 @@ async def _tally(alphas: AlphaVault, where: str, params: list[Any]) -> tuple[lis
     else:
         rows = []
     # Off the event loop: a cold start parses every row's JSON, which takes seconds.
-    await asyncio.to_thread(_judge, rows)
+    await compute.run(_judge, rows)
 
     ready: list[str] = []
     pending = near = 0
