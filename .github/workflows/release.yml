@@ -1,0 +1,392 @@
+# Cut a release: push a tag and users get an Update button. That is the whole procedure —
+# the tag is the only place a version is written, and `backend/pyproject.toml` stays at
+# 0.0.0.dev0 on main.
+#
+#   git tag v2026.9.21 && git push origin v2026.9.21
+#
+# Versions are dates, unpadded (`2026.9.5`, not `2026.09.05`), with `.1` for a second release
+# in a day. Dated rather than semantic on purpose: the app is a local tool with no API
+# consumers, so a major number would signal a stability promise nobody is owed, while a date
+# answers the only question a screenshot raises — how old is this build.
+#
+# To publish without offering it to anyone, tag a pre-release: `v2026.9.21rc1`. GitHub keeps
+# it out of /releases/latest, and only that release is copied to the latest.json the in-app
+# updater reads.
+#
+# The wheel carries the app and its built UI; `constraints.txt` pins every transitive
+# dependency to `uv.lock`, so an install a year from now resolves to what was tested today.
+# The desktop app (`desktop/`, an installer per system) only matters when it changes — users
+# who already have it keep it and take the wheel alone, which is the point of splitting them.
+#
+# Each installer is built on its own system, which is the only way to bundle a native WebView.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to build, without the leading v
+        required: true
+
+# Read only, but for the one job that publishes: every installed copy auto-installs what lands
+# on /releases/latest, so a token that can publish is kept away from the build steps. Actions
+# are pinned to commits for the same reason; a tag can be moved.
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+      # The pnpm version comes from `packageManager` in the frontend's package.json. Said
+      # here because the action looks in the repository root by default, and this repository
+      # keeps no package.json there — naming a version inline instead would be a second
+      # place to keep in step with the lockfile.
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          package_json_file: frontend/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: frontend/.node-version
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      # The tag is the only place a version is written. `backend/pyproject.toml` stays at
+      # 0.0.0.dev0 on main and is stamped here, so there is no bump commit to forget and no
+      # way for a tag and a file to disagree.
+      #
+      # Through the environment, never interpolated into the script: a ref name is attacker
+      # shaped text, and `${{ }}` pastes it in before bash ever sees a quote.
+      - name: Read the version from the tag
+        id: version
+        shell: bash
+        env:
+          REF: ${{ inputs.version || github.ref_name }}
+        run: |
+          uv run --with packaging --no-project --quiet python - <<'PY'
+          import os, pathlib
+          from packaging.version import InvalidVersion, Version
+
+          raw = os.environ["REF"].removeprefix("v")
+          try:
+              parsed = Version(raw)
+          except InvalidVersion:
+              raise SystemExit(f"::error::{raw!r} is not a PEP 440 version")
+          # The launcher builds `/releases/download/v{version}/`, and the wheel is named with
+          # the *normalised* version. A tag of v2026.09.21 would publish assets under a path
+          # that says 2026.9.21, so every download 404s. Demand the canonical spelling.
+          if str(parsed) != raw:
+              raise SystemExit(f"::error::tag v{raw} is not canonical; tag v{parsed} instead")
+
+          # Appended, never rewritten: these files carry whatever earlier steps put in them.
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              # A release candidate must never become /releases/latest: the updater reads
+              # that, and every running copy would offer it within the hour.
+              out.write(f"prerelease={str(parsed.is_prerelease).lower()}\n")
+              out.write(f"version={raw}\n")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"VERSION={raw}\n")
+          print(f"version {raw}, prerelease {parsed.is_prerelease}")
+          PY
+
+      # The ci.yml gate itself, so a tag cannot ship what a commit could not. Run against the
+      # committed lockfile, before anything is stamped: measured, uv is happy to sync a
+      # pyproject whose version has moved off uv.lock, but gating the tree exactly as it sits
+      # in git does not depend on it staying happy.
+      - run: cd backend && uv sync --frozen
+      - run: cd frontend && pnpm install --frozen-lockfile
+      - run: uvx lefthook@2.1.14 run check
+
+      # Into the package, so one wheel serves the whole app with no Node at runtime.
+      - run: cd frontend && pnpm build
+
+      # Only now, and only for the artefacts. `--frozen` leaves uv.lock exactly as it was gated.
+      - name: Stamp the version into pyproject
+        run: cd backend && uv version --frozen "$VERSION"
+
+      - run: cd backend && uv build --wheel
+      # With hashes: the launcher installs every dependency through this file, and uv refuses
+      # an artefact whose hash does not match one listed here. The project's own wheel is not
+      # in it (`--no-emit-project`) and stays unhashed, so this covers the PyPI leg only.
+      - run: cd backend && uv export --frozen --no-dev --no-emit-project -o dist/constraints.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: wheel
+          path: backend/dist/*
+
+  desktop:
+    # After the wheel job, so the version built in is the one that passed the canonical check
+    # rather than whatever the tag happened to say.
+    needs: wheel
+    strategy:
+      # One platform failing must not cancel the others: a run should report every build.
+      # Publishing still needs all four, so a partial release can never go out.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundle: nsis
+            built: nsis/*-setup.exe
+            asset: AlphaHarness-windows-x64-setup.exe
+          # Apple Silicon, whose oldest macOS is 11.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            macos: "11.0"
+            # The .app too: built alone, the .dmg leaves none behind for the check below.
+            bundle: app,dmg
+            built: dmg/*.dmg
+            asset: AlphaHarness-macOS-arm64.dmg
+          # Intel, built on Apple Silicon: the Intel runner took 8 minutes to compile what an
+          # Apple Silicon one does in under 3, and Apple's toolchain builds for both.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            macos: "10.15"
+            # Its uv is not the runner's own, so it is fetched, and checked against this.
+            uv-sha256: 2e4108f5395397c8bc5d43bf83d3bdbb2d0e92b90d0efa607756be704905fa33
+            # The .app too: built alone, the .dmg leaves none behind for the check below.
+            bundle: app,dmg
+            built: dmg/*.dmg
+            asset: AlphaHarness-macOS-x86_64.dmg
+          # Built against 24.04's glibc 2.39, which is what the .deb then needs (see
+          # tauri.conf.json); 22.04's runner is deprecated. A .deb rather than an AppImage: a
+          # browser drops a download's executable bit, while a .deb opens straight in the
+          # software installer.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundle: deb
+            built: deb/*.deb
+            asset: AlphaHarness-linux-amd64.deb
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Built into the app (see build.rs): what it installs on a fresh machine, and what it
+      # tells the app it is.
+      ALPHA_HARNESS_VERSION: ${{ needs.wheel.outputs.version }}
+      # The oldest macOS the build may need: see Build, and the check after it.
+      MACOS_FLOOR: ${{ matrix.macos }}
+      TARGET: ${{ matrix.target }}
+      # Pinned, not `latest`: uv ships inside the installer, so an upstream release must never
+      # change what a re-run of an old tag produces.
+      UV_VERSION: "0.12.18"
+      BUNDLE: ${{ matrix.bundle }}
+      BUILT: ${{ matrix.built }}
+      ASSET: ${{ matrix.asset }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # The action checks its checksum.
+      - id: uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          package_json_file: desktop/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: frontend/.node-version
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      # The version rust-toolchain.toml names, rather than whatever the runner image carries.
+      - run: |
+          cd desktop/src-tauri
+          rustup toolchain install
+          rustup target add "$TARGET"
+          rustc --version
+      - name: Install WebKitGTK and the tray's indicator library
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+
+      # Named for the target, as Tauri looks for a sidecar. setup-uv reports the binary without
+      # its extension on Windows (measured: `...\uv`), while the file on disk is uv.exe. Another
+      # architecture's uv is Astral's own build of the same version, held to its checksum.
+      - name: Bundle uv
+        env:
+          UV_PATH: ${{ steps.uv.outputs.uv-path }}
+          UV_SHA256: ${{ matrix.uv-sha256 }}
+        run: |
+          cd desktop/src-tauri
+          ext=""
+          if [ "$RUNNER_OS" = Windows ]; then ext=.exe; fi
+          sidecar="binaries/alpha-harness-uv-$TARGET$ext"
+          mkdir -p binaries
+          if [ -z "$UV_SHA256" ]; then
+            cp "${UV_PATH%.exe}$ext" "$sidecar"
+            "./$sidecar" --version
+          else
+            curl -fsSL -o "$RUNNER_TEMP/uv.tar.gz" \
+              "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-$TARGET.tar.gz"
+            echo "$UV_SHA256  $RUNNER_TEMP/uv.tar.gz" | shasum -a 256 -c -
+            tar -xzf "$RUNNER_TEMP/uv.tar.gz" -C "$RUNNER_TEMP"
+            cp "$RUNNER_TEMP/uv-$TARGET/uv" "$sidecar"
+            file "$sidecar"
+          fi
+
+      # Installers take semver, so a second release in a day, `.1`, goes in as `+1`: dpkg orders
+      # 2026.10.21 < 2026.10.21+1 < 2026.10.22, and NSIS makes it the fourth number. A candidate
+      # carries its release's version; semver's `-rc.1` would sort *after* it for dpkg. The app
+      # itself knows the full one. A file, not inline JSON, which Windows' quoting mangles.
+      #
+      # On macOS the floor goes to Info.plist through the config, and to every C compiler a
+      # crate's build script runs through MACOSX_DEPLOYMENT_TARGET. Info.plist wants plain
+      # numbers, and dragging an app in replaces it whatever its version, so no `+1` there.
+      #
+      # The Mac app keeps the PyInstaller launcher's name, AlphaHarness.app, so dragging it into
+      # Applications replaces that one (and its Dock icon) rather than sitting beside it. Only
+      # there: on Windows the name is the install folder's, and %LOCALAPPDATA%\AlphaHarness is
+      # the data folder.
+      - name: Build
+        run: |
+          IFS=. read -r year month day second <<<"$(grep -oE '^[0-9]+(\.[0-9]+)*' <<<"$ALPHA_HARNESS_VERSION")"
+          version="$year.$month.$day${second:++$second}"
+          if [ "$RUNNER_OS" = macOS ]; then
+            export MACOSX_DEPLOYMENT_TARGET="$MACOS_FLOOR"
+            printf '{"productName": "AlphaHarness", "version": "%s", "bundle": {"macOS": {"minimumSystemVersion": "%s"}}}\n' \
+              "$year.$month.$day" "$MACOS_FLOOR" > "$RUNNER_TEMP/version.json"
+          else
+            printf '{"version": "%s"}\n' "$version" > "$RUNNER_TEMP/version.json"
+          fi
+          cat "$RUNNER_TEMP/version.json"
+          pnpm --dir desktop install --frozen-lockfile
+          # --locked: built from Cargo.lock as committed, or not at all.
+          pnpm --dir desktop exec tauri build --target "$TARGET" --bundles "$BUNDLE" \
+            --config "$RUNNER_TEMP/version.json" -- --locked
+          cp desktop/src-tauri/target/$TARGET/release/bundle/$BUILT "$ASSET"
+
+      # Nothing else would notice an app that only opens on the runner's own macOS: CI builds it
+      # without complaint and the Macs it refuses are the users'.
+      - name: Check the oldest macOS it runs on
+        if: runner.os == 'macOS'
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, struct, sys
+
+          FLOOR = tuple(int(n) for n in os.environ["MACOS_FLOOR"].split("."))
+
+
+          def minimums(data):
+              """Each architecture's minimum macOS, from a thin or fat Mach-O's load commands."""
+              if data[:4] == b"\xca\xfe\xba\xbe":
+                  count = struct.unpack(">I", data[4:8])[0]
+                  arches = [struct.unpack(">5I", data[8 + 20 * i : 28 + 20 * i]) for i in range(count)]
+                  return [v for _, _, at, size, _ in arches for v in minimums(data[at : at + size])]
+              if data[:4] != b"\xcf\xfa\xed\xfe":
+                  return []
+              found, at = [], 32
+              for _ in range(struct.unpack("<I", data[16:20])[0]):
+                  command, size = struct.unpack("<II", data[at : at + 8])
+                  # LC_BUILD_VERSION holds it 12 bytes in; the older LC_VERSION_MIN_MACOSX, 8.
+                  offset = {0x32: 12, 0x24: 8}.get(command)
+                  if offset:
+                      value = struct.unpack("<I", data[at + offset : at + offset + 4])[0]
+                      found.append((value >> 16, (value >> 8) & 0xFF))
+                  at += size
+              return found
+
+
+          bundles = pathlib.Path("desktop/src-tauri/target", os.environ["TARGET"], "release/bundle")
+          built = list((bundles / "macos").glob("*.app"))
+          if len(built) != 1:
+              sys.exit(f"::error::expected one .app, found {built}")
+          app = built[0]
+          too_new = sorted(
+              {(version, file.name)
+               for file in app.rglob("*")
+               if file.is_file() and not file.is_symlink()
+               for version in minimums(file.read_bytes())
+               if version > FLOOR}
+          )
+          for (major, minor), name in too_new:
+              print(f"::error::{name} needs macOS {major}.{minor}; the floor is {FLOOR[0]}.{FLOOR[1]}")
+          sys.exit(1 if too_new else 0)
+          PY
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: desktop-${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  publish:
+    needs: [wheel, desktop]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: release
+          merge-multiple: true
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          # The checked version, never the raw input, which may already start with `v`.
+          tag_name: v${{ needs.wheel.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          # Keeps a candidate out of /releases/latest, which is the only thing the in-app
+          # updater reads. Tag `v0.1.1rc1` to build and publish without offering it to anyone.
+          prerelease: ${{ needs.wheel.outputs.prerelease == 'true' }}
+          files: release/*
+          body: |
+            **New here?** Download the one for your computer and install it. Its first start downloads Python and the app (about 330 MB), which takes a few minutes, then it opens in its own window.
+
+            - **Windows:** `AlphaHarness-windows-x64-setup.exe`. Windows warns that it does not recognise the app — it is unsigned. Choose **More info**, then **Run anyway**.
+            - **Mac:** `AlphaHarness-macOS-arm64.dmg` for Apple Silicon (M1 or later), or `AlphaHarness-macOS-x86_64.dmg` for Intel. Open it and drag **AlphaHarness** into Applications (if it asks, replace the old one). The first time, macOS will not open it because it is unsigned: open **System Settings › Privacy & Security**, scroll down, and choose **Open Anyway**.
+            - **Linux:** `AlphaHarness-linux-amd64.deb`, for Ubuntu 24.04 or later. Open it to install, or run `sudo apt install ./AlphaHarness-linux-amd64.deb`.
+
+            Closing the window keeps Alpha Harness in the tray (the menu bar on a Mac), so your tasks keep simulating. To stop it, choose **Quit Alpha Harness** there.
+
+            **Already have it?** Alpha Harness offers this version in the app. If it also asks you to install the new desktop app, quit the one you have, then install the one above: your data, Alphas and sign-in all carry over.
+
+  # The file every installed copy reads to learn of a release: what /releases/latest names now,
+  # on GitHub Pages. Never the API itself, which allows sixty anonymous calls an hour per
+  # address; a college hostel puts hundreds of people behind one. Once per repository: Settings
+  # > Pages > Source: GitHub Actions, and allow `v*` tags to deploy to the github-pages
+  # environment, which otherwise takes only the default branch.
+  pages:
+    needs: [wheel, publish]
+    # A candidate is never offered, so the file goes on naming the last real release.
+    if: needs.wheel.outputs.prerelease != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # Cut to what the app reads, under the API's own field names.
+      - name: Write latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir site
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
+            | jq '{tag_name, body, html_url, published_at, draft, prerelease,
+                   assets: [.assets[] | {name, browser_download_url}]}' > site/latest.json
+          jq -e '.tag_name' site/latest.json
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
