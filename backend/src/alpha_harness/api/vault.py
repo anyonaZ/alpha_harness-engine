@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from ..brain.filters import AlphaQuery
 from ..brain.platform import INSTRUMENT_TYPE, PLATFORM_ALPHA_URL
 from ..schemas import Out
+from ..singleflight import SingleFlight
 from ..tools import portfolio
 from ..vault import yields
 from ..vault.yields import checks_of
@@ -174,9 +175,17 @@ class AlphaPnl(Out):
     problem: str | None
 
 
+#: Requests for the same figures share one run (``singleflight``).
+_flights = SingleFlight()
+
+
 @router.get("")
 async def overview(state: State) -> VaultOverview:
     """How much of your history is stored, and where it is."""
+    return await _flights.run("overview", lambda: _overview(state))
+
+
+async def _overview(state: Any) -> VaultOverview:
     return VaultOverview.model_validate(
         {
             "counts": await state.alphas.counts(),
@@ -201,14 +210,19 @@ async def submittable(
     Each entry carries the platform's own check results, the numbers behind them, and a
     link to the alpha on BRAIN — which is where it gets submitted. This application never does.
     """
-    found = await yields.submittable(
-        state.db,
-        state.alphas,
-        region=region,
-        delay=delay,
-        universe=universe,
-        instrument_type=instrument_type,
-        limit=limit,
+    found = dict(
+        await _flights.run(
+            ("submittable", region, delay, universe, instrument_type, limit),
+            lambda: yields.submittable(
+                state.db,
+                state.alphas,
+                region=region,
+                delay=delay,
+                universe=universe,
+                instrument_type=instrument_type,
+                limit=limit,
+            ),
+        )
     )
     # Without a series a candidate cannot be de-correlated against the others.
     state.backfill.schedule_returns(found.pop("pnlMissing"))

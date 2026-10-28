@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from sqlalchemy import func, select, update
 
+from .. import events
 from ..brain.errors import (
     BrainAuthError,
     BrainDailyLimitReached,
@@ -53,8 +54,14 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
-#: How often the poll loop wakes to look for work.
-TICK_SECONDS = 1.0
+#: Shortest and longest the poll loop sleeps between rounds. It sleeps until the earliest
+#: read that is due, within these; with nothing to read, until a submission wakes it or the
+#: next stale-send sweep is due.
+MIN_SLEEP_SECONDS = 0.25
+MAX_SLEEP_SECONDS = 30.0
+#: Least time between two pushes of the active set. A round that reads twenty simulations
+#: can change twenty rows; the screens need the last state, not each step.
+NOTIFY_GAP_SECONDS = 1.0
 #: Fallback interval when the platform gives us no Retry-After.
 DEFAULT_POLL_SECONDS = 3.0
 #: A PENDING row older than this crashed mid-submit and needs attention.
@@ -106,6 +113,11 @@ class SimulationTracker:
         self._last_sweep = time.monotonic()
         #: The orphan pass, run beside the poll loop so polling never waits on a listing.
         self._reconcile: asyncio.Task[dict[str, int] | None] | None = None
+        #: Woken when a simulation has a platform id to read.
+        self._wake = events.bus.subscribe(events.SUBMITTED)
+        #: When the active set was last pushed, and the push waiting to follow it.
+        self._last_notify = float("-inf")
+        self._trailing: asyncio.Task[None] | None = None
 
     # -- lifecycle -------------------------------------------------------
 
@@ -246,6 +258,7 @@ class SimulationTracker:
         batch is picked up without waiting for a sweep.
         """
         self._next_poll[platform_id] = time.monotonic() + (delay or 0.0)
+        events.bus.publish(events.SUBMITTED)
 
     # -- cancellation ----------------------------------------------------
 
@@ -435,10 +448,16 @@ class SimulationTracker:
     # -- polling ---------------------------------------------------------
 
     async def _run(self) -> None:
-        """Poll every active simulation, honouring each one's Retry-After."""
+        """Poll every active simulation, honouring each one's Retry-After.
+
+        Between rounds it sleeps until the earliest read is due rather than looking every
+        second: a simulation answers with a Retry-After of seconds, and an idle app has
+        nothing to read at all.
+        """
         while True:
+            due: float | None = None
             try:
-                await self._tick()
+                due = await self._tick()
                 if time.monotonic() - self._last_sweep >= SWEEP_SECONDS:
                     self._last_sweep = time.monotonic()
                     await self.orphan_stale()
@@ -447,25 +466,37 @@ class SimulationTracker:
                         self._reconcile = spawn(self.reconcile_orphans(), name="orphan-reconcile")
             except Exception:
                 log.exception("tracker.tick_failed")
-            await asyncio.sleep(TICK_SECONDS)
+            now = time.monotonic()
+            until_sweep = self._last_sweep + SWEEP_SECONDS - now
+            sleep = min(
+                MAX_SLEEP_SECONDS, until_sweep, due - now if due is not None else until_sweep
+            )
+            await self._wake.wait(max(MIN_SLEEP_SECONDS, sleep))
 
-    async def _tick(self) -> None:
+    async def _tick(self) -> float | None:
+        """One round of reads. Returns when the next read falls due, or ``None`` if none will."""
         records = await self.active()
         if not records:
-            return
+            return None
 
         changed = False
+        due: float | None = None
         for record in records:
-            if not record.platform_id:
+            platform_id = record.platform_id
+            if not platform_id:
                 continue
             if record.is_batch and record.child_ids:
                 # Fanned out: the engine polls its children and finishes it.
                 continue
             if await self._poll_one(record):
                 changed = True
+            next_read = self._next_poll.get(platform_id)
+            if next_read is not None:
+                due = next_read if due is None else min(due, next_read)
 
         if changed:
             await self.notify()
+        return due
 
     async def _poll_one(self, record: SimulationRecord) -> bool:
         """One status read, if one is due. Returns True if anything changed."""
@@ -583,12 +614,14 @@ class SimulationTracker:
                 **finished,
             )
         log.info("sim.fanned_out", record_id=record.id, children=len(outcome.children))
+        events.bus.publish(events.SETTLED)
         return bool(won)
 
     async def _apply_terminal(self, record: SimulationRecord, outcome: Outcome) -> bool:
         """Write a finished simulation's outcome."""
         async with self.db.session() as session:
             landed = await finish(session, record, outcome)
+        events.bus.publish(events.SETTLED)
         log.info(
             "sim.finished",
             record_id=record.id,
@@ -627,11 +660,29 @@ class SimulationTracker:
             values["finished_at"] = utcnow()
         async with self.db.session() as session:
             moved = await transition(session, record_id, from_=from_, **values)
+        if moved and finished:
+            events.bus.publish(events.SETTLED)
         await self.notify()
         return bool(moved)
 
     async def notify(self) -> None:
-        """Push what is pending or running now; the batch engine announces through this too."""
+        """Push what is pending or running now; the batch engine announces through this too.
+
+        At most one push per :data:`NOTIFY_GAP_SECONDS`: a change inside the gap is pushed
+        once when it ends, with the state as it is then, so the last change always lands.
+        """
+        wait = self._last_notify + NOTIFY_GAP_SECONDS - time.monotonic()
+        if wait <= 0:
+            await self._push()
+        elif self._trailing is None or self._trailing.done():
+            self._trailing = spawn(self._push_after(wait), name="tracker-notify")
+
+    async def _push_after(self, wait: float) -> None:
+        await asyncio.sleep(wait)
+        await self._push()
+
+    async def _push(self) -> None:
+        self._last_notify = time.monotonic()
         try:
             await self._on_change([serialise(r) for r in await self.active()])
         except Exception:

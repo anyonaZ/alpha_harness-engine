@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from sqlalchemy import func, or_, select, update
 
-from .. import resources
+from .. import compute, events, resources
 from ..brain.platform import IGNORED_CHECKS, QUOTA_CHECKS
 from ..brain.schemas import FULL_MODE, QUICK_MODE
 from ..db.models import (
@@ -59,8 +59,11 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = structlog.get_logger(__name__)
 
-#: How often a running study looks for finished trials.
-POLL_SECONDS = 5.0
+#: How often running tasks are advanced when nothing wakes the optimizer sooner. A settled
+#: simulation, a stored Alpha or a change to a task wakes it at once (``events``).
+POLL_SECONDS = 15.0
+#: The same with no task running: queued tasks start when a slot frees, which wakes it.
+IDLE_POLL_SECONDS = 60.0
 
 #: Statistics the local Alpha store keeps, so objectives on them need no second BRAIN read.
 VAULT_STATS = frozenset(
@@ -97,6 +100,9 @@ class Optimizer:
         self.alphas = alphas
         self.backfill = backfill
         self.studies: dict[int, optuna.Study] = {}
+        #: Search and Template Lab tasks' tried fields and scored points, kept between refills
+        #: (``scheduler._trial_memory``).
+        self.trial_memory: dict[int, scheduler.TrialMemory] = {}
         #: Live Optuna trial objects for the round in flight, keyed study -> our trial
         #: number. Lost on restart, which :func:`_tell_many` handles by replaying.
         self.open_trials: dict[int, dict[int, Any]] = {}
@@ -105,6 +111,9 @@ class Optimizer:
         #: tick by :func:`scheduler.start_waiting`, read by :func:`scheduler.advance`.
         self.lendable_cores = 0
         self._task: asyncio.Task[None] | None = None
+        #: Woken when a trial may have something new: a simulation settled, an Alpha was
+        #: stored, or a task was added, started, paused or advanced.
+        self._wake = events.bus.subscribe(events.SETTLED, events.STORED, events.TASK_CHANGED)
 
     # -- lifecycle -------------------------------------------------------
 
@@ -124,11 +133,12 @@ class Optimizer:
 
     async def _run(self) -> None:
         while True:
+            running: dict[int, dict[str, int]] | None = None
             try:
-                await self.tick()
+                running = await self.tick()
             except Exception:
                 log.exception("optimize.tick_failed")
-            await asyncio.sleep(POLL_SECONDS)
+            await self._wake.wait(POLL_SECONDS if running or running is None else IDLE_POLL_SECONDS)
 
     async def tick(self) -> dict[int, dict[str, int]]:
         """Start waiting tasks that fit, then advance every running study by one round."""
@@ -150,6 +160,8 @@ class Optimizer:
         for study_id in self.studies.keys() - set(ids):
             del self.studies[study_id]
             self.open_trials.pop(study_id, None)
+        for study_id in self.trial_memory.keys() - set(ids):
+            del self.trial_memory[study_id]
         results: dict[int, dict[str, int]] = {}
         for study_id in ids:
             try:
@@ -360,7 +372,7 @@ class Optimizer:
             replayed = [t.id for asked, t, _, _ in finished if asked is None]
             asked_over = await self._distributions(replayed) if replayed else {}
             loader = _Distributions(scheduler.field_slots(row) if replayed else {})
-            await asyncio.to_thread(_tell_many, study, finished, asked_over, loader)
+            await compute.run(_tell_many, study, finished, asked_over, loader)
 
         # A Quick Alpha that passed every check BRAIN ran is owed a run in Full mode, which is
         # what BRAIN submits. Parked here; the scheduler sends it ahead of the search.
@@ -507,7 +519,7 @@ class Optimizer:
 
         sampler = make_sampler(params_of(row, SearchParams).n_startup_trials, row.batch_size)
         loader = _Distributions(scheduler.field_slots(row))
-        study = await asyncio.to_thread(_rebuild, sampler, history, loader)
+        study = await compute.run(_rebuild, sampler, history, loader)
         self.studies[study_id] = study
         return study
 
@@ -516,6 +528,7 @@ class Optimizer:
         self.studies.pop(study_id, None)
         self._locks.pop(study_id, None)
         self.open_trials.pop(study_id, None)
+        self.trial_memory.pop(study_id, None)
 
     # -- reading ---------------------------------------------------------
 
@@ -542,6 +555,8 @@ class Optimizer:
         self.forget(study_id)
 
     async def notify(self) -> None:
+        # Also a reason to look again: a task added, started or advanced may have more to do.
+        events.bus.publish(events.TASK_CHANGED)
         await self._on_change({"kind": "studies"})
 
 

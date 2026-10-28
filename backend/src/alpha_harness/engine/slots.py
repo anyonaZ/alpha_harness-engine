@@ -22,7 +22,7 @@ import structlog
 from pydantic import ValidationError
 from sqlalchemy import delete, func, select, update
 
-from .. import resources
+from .. import events, resources
 from ..brain.errors import (
     BrainAuthError,
     BrainDailyLimitReached,
@@ -64,13 +64,16 @@ log = structlog.get_logger(__name__)
 #: Added to a batched simulation's outcome when BRAIN named no child, so it was matched by order.
 POSITIONAL_NOTE = "Matched to this request by submission order."
 
-#: How often the engine looks for work.
+#: How often the engine looks for work while some is running, queued or being read back.
 TICK_SECONDS = 2.0
+#: How long an idle engine sleeps when nothing wakes it: queueing work, a simulation
+#: settling, a quota reset or a session coming back.
+IDLE_SECONDS = 60.0
 
-#: Rounds between sleep-block checks (~30 s): pending work changes slowly.
-AWAKE_TICKS = 15
+#: Least time between sleep-block checks: pending work changes slowly.
+AWAKE_SECONDS = 30.0
 
-#: A wait of TICK_SECONDS that took this long means the computer slept through it.
+#: A wait that overran what was asked of it by this long means the computer slept through it.
 SLEEP_GAP = 60.0
 
 #: The task work carries when nothing owns it — a one-off run from the UI rather than a
@@ -135,12 +138,14 @@ class BatchEngine:
         self.max_batch = MULTI_SIMULATION_SIZE
         #: Set once BRAIN refuses a batch with 403; lasts for the process.
         self._batch_refused = False
-        #: Blocks OS sleep while work is pending; checked every AWAKE_TICKS rounds.
+        #: Blocks OS sleep while work is pending; checked every AWAKE_SECONDS and on any change.
         self._awake = StayAwake()
         #: Wall-clock start and end of the last sleep the engine noticed, for the Matrix.
         self._last_pause: tuple[datetime, datetime] | None = None
         #: When queued work with no task was last swept up. Zero so the first tick sweeps.
         self._last_orphan_sweep = 0.0
+        #: Woken when work is queued or a simulation settles, so an idle engine sleeps.
+        self._wake = events.bus.subscribe(events.QUEUED, events.SETTLED)
 
     # -- lifecycle -------------------------------------------------------
 
@@ -287,6 +292,8 @@ class BatchEngine:
                 )
 
         log.info("engine.enqueued", task=task, queued=len(queued), skipped=len(skipped))
+        if queued:
+            events.bus.publish(events.QUEUED)
         await self.tracker.notify()
         return {"queued": queued, "skipped": skipped, "outcomes": outcomes}
 
@@ -469,26 +476,44 @@ class BatchEngine:
     # -- the loop --------------------------------------------------------
 
     async def _run(self) -> None:
-        rounds = 0
+        """Rounds every :data:`TICK_SECONDS` while there is work, and none while there is not.
+
+        An idle engine used to look every two seconds for as long as the app was open. It now
+        sleeps until work is queued or a simulation settles (``events``), looking anyway
+        every :data:`IDLE_SECONDS` and when BRAIN's quota resets.
+        """
+        last_awake = float("-inf")
         while True:
+            busy = True
             try:
                 await self.tick()
-                if rounds % AWAKE_TICKS == 0:
+                busy = await self._busy(reading=True)
+                if busy != (self._awake.state == "held") or (
+                    time.monotonic() - last_awake >= AWAKE_SECONDS
+                ):
+                    last_awake = time.monotonic()
                     budget = resources.budget()
                     allowed = budget.awake_on_battery or not resources.on_battery()
                     self._awake.hold(
                         self.keep_awake and allowed and await self._busy(), budget.awake_what
                     )
-                rounds += 1
             except Exception:
                 log.exception("engine.tick_failed")
-            # Only the wait is timed: a slow round is not a sleep, a two-second nap that took
-            # a minute is.
+            timeout = TICK_SECONDS if busy else await self._idle_timeout()
+            # Only the wait is timed: a slow round is not a sleep, a nap that overran what was
+            # asked of it by a minute is.
             before = time.time()
-            await asyncio.sleep(TICK_SECONDS)
-            if time.time() - before > SLEEP_GAP:
+            await self._wake.wait(timeout)
+            if time.time() - before - timeout > SLEEP_GAP:
                 self._last_pause = (datetime.fromtimestamp(before, UTC), datetime.now(UTC))
                 log.warning("engine.slept", seconds=round(time.time() - before))
+
+    async def _idle_timeout(self) -> float:
+        """How long an idle engine may sleep: until BRAIN's quota resets, if that is sooner."""
+        reset = self._limit_resets_at
+        if self._daily_limit_hit and reset is not None:
+            return max(TICK_SECONDS, min(IDLE_SECONDS, reset - time.time() + 1.0))
+        return IDLE_SECONDS
 
     async def tick(self) -> int:
         """One scheduling round. Returns how many batches were submitted.
@@ -1086,6 +1111,7 @@ class BatchEngine:
                 ):
                     landed.append(alpha_id)
 
+        events.bus.publish(events.SETTLED)
         # The tracker polls only the parent, which carries no alpha of its own. Without
         # this hand-off no batched alpha would reach the vault, so nothing batched could
         # ever be judged submittable.
@@ -1102,10 +1128,25 @@ class BatchEngine:
 
     # -- helpers ---------------------------------------------------------
 
-    async def _busy(self) -> bool:
-        """Work that still needs this machine awake: running, or queued and sendable."""
+    async def _busy(self, *, reading: bool = False) -> bool:
+        """Work that still needs this machine awake: running, or queued and sendable.
+
+        ``reading`` also counts batches whose children are still being read back, which keep
+        the engine's rounds going though they hold no slot.
+        """
         async with self.db.session() as session:
             if await self._in_flight_by_task(session):
+                return True
+            if reading and await session.scalar(
+                select(
+                    select(SimulationRecord.id)
+                    .where(
+                        SimulationRecord.is_batch.is_(True),
+                        SimulationRecord.children_expanded.is_(False),
+                    )
+                    .exists()
+                )
+            ):
                 return True
             if self._daily_limit_hit or self._session_lost:
                 return False

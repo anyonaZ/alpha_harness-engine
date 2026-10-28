@@ -27,7 +27,7 @@ wheels = [
 
 [[package]]
 name = "alpha-harness"
-version = "2026.10.24.1+lean1"
+version = "2026.10.24.1+lean2"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },

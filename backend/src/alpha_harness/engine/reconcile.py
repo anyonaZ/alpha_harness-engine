@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from sqlalchemy import select
 
+from .. import events
 from ..brain.errors import BrainAuthError, BrainError
 from ..brain.filters import AlphaQuery
 from ..brain.platform import ALPHA_LIST_MAX_OFFSET, ALPHA_LIST_PAGE
@@ -278,6 +279,8 @@ async def reconcile_orphans(
 
     for alpha_id in landed:
         on_alpha(alpha_id)
+    if requeued:
+        events.bus.publish(events.QUEUED)
     if landed or requeued or abandon:
         log.warning(
             "reconcile.resolved",
