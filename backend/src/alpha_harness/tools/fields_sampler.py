@@ -28,6 +28,7 @@ from typing import Any, Literal
 
 from sqlalchemy import func, select
 
+from .. import compute
 from ..brain.schemas import SimulationRequest, SimulationSettings
 from ..brain.settings_schema import chosen_labels
 from ..catalog import search
@@ -148,7 +149,7 @@ async def buckets(
         members = [r for r in usable if r["field_type"] == kind]
         texts = [FieldText(r["field_id"], r["description"] or "", r["coverage"]) for r in members]
         by_id = {r["field_id"]: r for r in members}
-        split_up = await asyncio.to_thread(split, texts, of_kind)
+        split_up = await compute.run(split, texts, of_kind)
         for seed, bucket in zip(of_kind, split_up, strict=True):
             listed = [
                 Candidate(f, by_id[f]["dataset_id"], "bucket", by_id[f]["coverage"])

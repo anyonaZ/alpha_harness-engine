@@ -30,6 +30,7 @@ import numpy as np
 import structlog
 from sqlalchemy import String, func, select, type_coerce
 
+from .. import compute
 from ..brain.platform import (
     IGNORED_CHECKS,
     REGION_AGNOSTIC_REGION,
@@ -676,7 +677,7 @@ async def _parents(optimizer: Optimizer, ranked: list[Trial], limit: int) -> lis
     if missing and optimizer.backfill is not None:
         optimizer.backfill.schedule_returns(missing)
     series = {a: profile_of(regions, days) for a, regions in where.items()}
-    kept = set(await asyncio.to_thread(independent, ids, series, limit))
+    kept = set(await compute.run(independent, ids, series, limit))
     return [t for t in ranked if t.alpha_id in kept]
 
 
@@ -732,9 +733,7 @@ async def breed(
 
     generation = 1 + (bred or 0) // population
     # Off the event loop: each key validates a trial's settings.
-    seen = await asyncio.to_thread(
-        lambda: {ga_key(e, json.loads(s or "null")) for e, s in identities}
-    )
+    seen = await compute.run(lambda: {ga_key(e, json.loads(s or "null")) for e, s in identities})
     rate = run.mutation_rate or MUTATION_RATE
     shapes = {p.tree: Shape.of(p.tree, market) for p in parents}
     rng = random.Random()
@@ -842,7 +841,7 @@ async def auto_seeds(
     reasons: list[dict[str, str]] = []
     examined = 0
     # Off the event loop: a market holds tens of thousands, and each score parses its checks.
-    ranked = await asyncio.to_thread(lambda: sorted(rows, key=seed_score, reverse=True))
+    ranked = await compute.run(lambda: sorted(rows, key=seed_score, reverse=True))
     for row in ranked:
         if len(kept) >= want or examined >= MAX_EXAMINED:
             break
@@ -859,7 +858,7 @@ async def auto_seeds(
             if missing:
                 days = await state.alphas.train_pnl(list(regions.values()))
             own = profile_of(regions, days)
-            hit = await asyncio.to_thread(collision, own, kept_series) if own else None
+            hit = await compute.run(collision, own, kept_series) if own else None
             if own is None:
                 problem = "No usable daily PnL."
             elif hit:

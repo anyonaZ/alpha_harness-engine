@@ -1,16 +1,17 @@
 """Portfolio: submitted Alphas combined at equal weight, as BRAIN combines its own pool."""
 
-import asyncio
 import math
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
+from .. import compute as heavy
 from ..brain.platform import REGION_AGNOSTIC_CLASS, TRADING_DAYS
 from ..brain.settings_schema import chosen_labels
 from ..labs.fastexpr import ParseError, data_fields, parse
 from ..schemas import Out
+from ..singleflight import SingleFlight
 from ..tools import portfolio, power_pool
 from ..vault.store import SERIES_VERSION, json_list
 from ..vault.yields import checks_of, limits_of
@@ -302,6 +303,10 @@ def _pnl_version(row: dict[str, Any]) -> Any:
     return row.get("series_version") if version is None else version
 
 
+#: Requests for the same figures share one run (``singleflight``).
+_flights = SingleFlight()
+
+
 @router.get("/members")
 async def members(
     state: State,
@@ -309,32 +314,36 @@ async def members(
 ) -> PortfolioMembers:
     """Every submitted Alpha stored locally. With ``costBps``, its figures and correlations are
     worked out on its daily PnL net of that cost instead of read from BRAIN."""
+    return await _flights.run(("members", cost_bps), lambda: _members(state, cost_bps))
+
+
+async def _members(state: Any, cost_bps: float | None) -> PortfolioMembers:
     rows = await state.alphas.submitted_members()
     ids = [str(r["alpha_id"]) for r in rows]
     series = await state.alphas.series(ids)
     meta = await state.alphas.by_ids(ids)
     # Laid out once for everything below: it was each one's slowest step.
     with_series = [a for a in dict.fromkeys(ids) if series.get(a)]
-    framed = await asyncio.to_thread(portfolio.frame, series, meta, with_series, cost_bps or 0.0)
+    framed = await heavy.run(portfolio.frame, series, meta, with_series, cost_bps or 0.0)
     # Worked out even at no cost: some figures, like the K-ratio, BRAIN does not report.
-    net = await asyncio.to_thread(portfolio.framed_figures, with_series, framed, meta)
+    net = await heavy.run(portfolio.framed_figures, with_series, framed, meta)
     if cost_bps is None:
         # The PnL the grid reads, from the frame: only an Alpha holding a PnL without turnover
         # is read again, as a frame has no column for it.
         current = {a for a, row in meta.items() if _pnl_version(row) == SERIES_VERSION}
         framed_ids = set(with_series)
         extra = await state.alphas.pnl_grid([a for a in current if a not in framed_ids])
-        grid = await asyncio.to_thread(portfolio.framed_grid, with_series, framed, current, extra)
+        grid = await heavy.run(portfolio.framed_grid, with_series, framed, current, extra)
     else:
         # Net of cost, the grid is the frame cut to the days BRAIN exported: measured, the
         # same to the cell as reading the PnL again and costing it, at a fifth of the time.
-        dates, pnl, _ = await asyncio.to_thread(portfolio.exported, *framed)
+        dates, pnl, _ = await heavy.run(portfolio.exported, *framed)
         grid = (with_series, dates, pnl)
-    highest = await asyncio.to_thread(portfolio.highest_correlations, with_series, framed)
-    together = await asyncio.to_thread(portfolio.portfolio_correlations, with_series, framed)
-    adds = await asyncio.to_thread(portfolio.incremental_sharpes, with_series, framed)
-    own = await asyncio.to_thread(power_pool.self_correlations, grid, meta, rows)
-    pooled = await asyncio.to_thread(power_pool.power_pool_correlations, grid, meta, rows)
+    highest = await heavy.run(portfolio.highest_correlations, with_series, framed)
+    together = await heavy.run(portfolio.portfolio_correlations, with_series, framed)
+    adds = await heavy.run(portfolio.incremental_sharpes, with_series, framed)
+    own = await heavy.run(power_pool.self_correlations, grid, meta, rows)
+    pooled = await heavy.run(power_pool.power_pool_correlations, grid, meta, rows)
     out: list[PortfolioMember] = []
     for r in rows:
         pyramids = json_list(r["pyramids"])
@@ -456,8 +465,14 @@ async def markdown(body: CopyRequest, state: State) -> CopiedAlphas:
 async def compute(body: PortfolioRequest, state: State) -> PortfolioResult:
     """These Alphas combined at equal weight: stats, yearly rows, partitions, correlations."""
     ids = list(dict.fromkeys(body.alpha_ids))
+    return await _flights.run(
+        ("compute", tuple(ids), body.cost_bps), lambda: _compute(state, ids, body.cost_bps)
+    )
+
+
+async def _compute(state: Any, ids: list[str], cost_bps: float | None) -> PortfolioResult:
     series = await state.alphas.series(ids)
     missing = [a for a in ids if a not in series]
     meta = await state.alphas.by_ids(ids)
-    found = await asyncio.to_thread(portfolio.compute, series, meta, ids, body.cost_bps)
+    found = await heavy.run(portfolio.compute, series, meta, ids, cost_bps)
     return PortfolioResult.model_validate(found | {"missing": missing})

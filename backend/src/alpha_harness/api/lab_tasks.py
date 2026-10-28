@@ -18,6 +18,7 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, update
 
+from .. import compute
 from ..brain.errors import BrainError, BrainRateLimited
 from ..brain.platform import (
     POWER_POOL_CORRELATION_CEILING,
@@ -713,7 +714,7 @@ async def power_pool_order(body: AlphaIds, state: State) -> SubmissionOrder:
         if (region := power_pool.scope_of(row)) is not None:
             pools.setdefault(region, []).append(alpha_id)
     meta = candidates | pool_meta
-    picks, blocked, unmeasured = await asyncio.to_thread(
+    picks, blocked, unmeasured = await compute.run(
         power_pool.submission_order, grid, meta, list(candidates), pools
     )
     blocks = Counter(blocked.values())
@@ -954,7 +955,7 @@ async def _power_pool(state: State, alpha_ids: list[str]) -> PowerPoolCorrelatio
         members = by_region[region]
         # Every member, synced or not: a member without PnL is a collision nobody measured,
         # and an unsynced pool must read as unmeasured, not as an empty one.
-        found = await asyncio.to_thread(power_pool.correlate, grid, meta, wanted[region], members)
+        found = await compute.run(power_pool.correlate, grid, meta, wanted[region], members)
         measured.extend(PowerPoolRow.model_validate(r | {"region": region}) for r in found)
         scopes.append(
             PowerPoolScope(
@@ -1018,7 +1019,7 @@ async def _not_refused(session: Any, ids: list[tuple[int, str | None]]) -> list[
             _REFUSED[trial_id, alpha_id] = refused
 
     # Off the event loop: the first refresh after a start judges every finished trial.
-    await asyncio.to_thread(judge)
+    await compute.run(judge)
     return [i for i, alpha_id in ids if not _REFUSED.get((i, alpha_id), False)]
 
 
