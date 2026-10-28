@@ -72,6 +72,20 @@ the environment is the default when nothing was chosen there.
 
 ## Measured
 
+Idle, app open with nothing queued, started as people start it (`python -m alpha_harness`),
+180 s window after 30 s to settle, from `/proc`:
+
+| Build | CPU | Wake-ups |
+| --- | --- | --- |
+| Upstream v2026.10.24.1 | 0.68% of a core | 52.0 a second |
+| Lean, Phases 0 to 2 | 0.62% | 50.6 a second |
+| Lean, Phase 3, Balanced | 0.07% | 4.6 a second |
+| Lean, Phase 3, Lean profile | 0.06% | 4.5 a second |
+
+The upstream wake-ups were mostly uvicorn's ten-a-second housekeeping and the three loops'
+fixed beats; what remains is the event loop's one-a-second housekeeping and SQLite's
+connection threads.
+
 From the benchmarks in `bench/`, run from `backend/`. CPU of one Search Lab refill of 10
 points, 1,500-field pool:
 
