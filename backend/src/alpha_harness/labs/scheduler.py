@@ -10,12 +10,14 @@ import functools
 import json
 import random
 import time
+from dataclasses import dataclass
+from dataclasses import field as default
 from typing import TYPE_CHECKING, Any
 
 import structlog
 from sqlalchemy import String, func, not_, or_, select, type_coerce, update
 
-from .. import resources
+from .. import compute, resources
 from ..brain.platform import MULTI_SIMULATION_SIZE
 from ..brain.schemas import SimulationRequest, SimulationSettings, SimulationType
 from ..brain.settings_schema import validate_settings
@@ -40,6 +42,7 @@ from .params import (
 
 if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Sequence
+    from datetime import datetime
 
     import optuna
 
@@ -529,19 +532,7 @@ async def advance(optimizer: Optimizer, study_id: int) -> int:
 
     space = run.space
     key, coverable = lab.coverage(space)
-    async with optimizer.db.session() as session:
-        counted = (
-            await session.execute(
-                select(
-                    Trial.state,
-                    raw_json(Trial.params),
-                    Trial.expression,
-                    raw_json(Trial.settings),
-                    raw_json(Trial.values),
-                ).where(Trial.study_id == study_id, Trial.state != TrialState.PRUNED)
-            )
-        ).all()
-    tried, seen = await asyncio.to_thread(_search_memory, counted, key)
+    tried, seen = await _trial_memory(optimizer, study_id, key)
     limit = row.max_trials // 2
     cover: list[str] = []
     if len(tried) < limit:
@@ -550,7 +541,7 @@ async def advance(optimizer: Optimizer, study_id: int) -> int:
 
     study = await optimizer.optuna_study(study_id, row, may_rebuild=True)
     schema = await optimizer.metadata.cached_settings_schema()
-    picked, withdrawn = await asyncio.to_thread(
+    picked, withdrawn = await compute.run(
         ask_points,
         study,
         lab,
@@ -593,10 +584,86 @@ def full_run() -> Any:
     return func.json_extract(Trial.params, "$.fullOf").is_not(None)
 
 
+#: Refills between full reloads of a task's trial memory. Between them only trials created or
+#: finished since the last load are read; a full reload now and then puts right anything a
+#: path that changes trials without either mark might have left behind.
+FULL_RELOAD_EVERY = 25
+
+
+@dataclass(slots=True)
+class TrialMemory:
+    """What a Search or Template Lab task has tried and scored, kept between refills."""
+
+    tried: set[Any] = default(default_factory=set[Any])
+    seen: dict[tuple[str, str], float | bool] = default(
+        default_factory=dict[tuple[str, str], float | bool]
+    )
+    #: The trial each point's score came from: a newer trial's score wins, as when every
+    #: trial is read in order.
+    scored_by: dict[tuple[str, str], int] = default(default_factory=dict[tuple[str, str], int])
+    #: The newest trial id and finish time read, and refills since the last full read.
+    last_id: int = 0
+    last_finished: datetime | None = None
+    refills: int = 0
+
+
+async def _trial_memory(
+    optimizer: Optimizer, study_id: int, covers: str
+) -> tuple[set[Any], dict[tuple[str, str], float | bool]]:
+    """The fields a task has tried as ``covers``, and every point it has scored.
+
+    Read whole once, then only the trials created or finished since: a refill used to read and
+    decode every trial the task ever ran (0.8 s at 100,000), and runs each time a batch
+    returns. A trial's finish time is written with its score, and new trials have new ids, so
+    between the two marks nothing that changes the answer is missed.
+    """
+    memory = optimizer.trial_memory.get(study_id)
+    whole = memory is None or memory.refills >= FULL_RELOAD_EVERY
+    if memory is None or whole:
+        memory = TrialMemory()
+    conditions: list[Any] = [Trial.study_id == study_id, Trial.state != TrialState.PRUNED]
+    if not whole:
+        changed = [Trial.id > memory.last_id]
+        if memory.last_finished is not None:
+            changed.append(Trial.finished_at >= memory.last_finished)
+        conditions.append(or_(*changed))
+    async with optimizer.db.session() as session:
+        rows = (
+            await session.execute(
+                select(
+                    Trial.state,
+                    raw_json(Trial.params),
+                    Trial.expression,
+                    raw_json(Trial.settings),
+                    raw_json(Trial.values),
+                    Trial.id,
+                    Trial.finished_at,
+                ).where(*conditions)
+            )
+        ).all()
+    tried, seen = await compute.run(_search_memory, [r[:6] for r in rows], covers)
+    memory.tried |= tried
+    for key, (trial_id, score) in seen.items():
+        if memory.scored_by.get(key, -1) <= trial_id:
+            memory.seen[key] = score
+            memory.scored_by[key] = trial_id
+    for row in rows:
+        memory.last_id = max(memory.last_id, int(row[5]))
+        finished: datetime | None = row[6]
+        if finished is not None and (
+            memory.last_finished is None or finished > memory.last_finished
+        ):
+            memory.last_finished = finished
+    memory.refills = 0 if whole else memory.refills + 1
+    optimizer.trial_memory[study_id] = memory
+    return memory.tried, memory.seen
+
+
 def _search_memory(
     rows: Sequence[Any], covers: str
-) -> tuple[set[Any], dict[tuple[str, str], float | bool]]:
-    """The fields tried as ``covers`` and every point already scored, from unpruned trials.
+) -> tuple[set[Any], dict[tuple[str, str], tuple[int, float | bool]]]:
+    """The fields tried as ``covers`` and every point already scored, from unpruned trials,
+    each score with the id of the trial it came from, so a newer trial's wins.
 
     Runs in a worker thread: identity keys validate each trial's settings, which costs
     seconds at the largest task sizes. A task reuses a few settings many times over, so each
@@ -608,15 +675,18 @@ def _search_memory(
         return search.settings_identity(json.loads(raw or "null"))
 
     tried: set[Any] = set()
-    seen: dict[tuple[str, str], float | bool] = {}
-    for state, params, expression, settings, values in rows:
+    seen: dict[tuple[str, str], tuple[int, float | bool]] = {}
+    for state, params, expression, settings, values, trial_id in rows:
         tried.add((json.loads(params or "null") or {}).get(covers))
         key = (expression or "", settings_of(settings))
         scores = json.loads(values or "null")
+        score: float | bool | None = None
         if state == TrialState.COMPLETE and scores:
-            seen[key] = float(scores[0])
+            score = float(scores[0])
         elif state == TrialState.FAIL:
-            seen[key] = False
+            score = False
+        if score is not None and (key not in seen or seen[key][0] <= trial_id):
+            seen[key] = (int(trial_id), score)
     return tried, seen
 
 
@@ -733,7 +803,7 @@ async def _stalled(optimizer: Optimizer, row: Study) -> bool:
                 select(Trial.state, raw_json(Trial.values)).where(*spent).order_by(Trial.number)
             )
         ).all()
-    verdict = await asyncio.to_thread(lambda: ga.stalled(_spent(spent_rows)))
+    verdict = await compute.run(lambda: ga.stalled(_spent(spent_rows)))
     _STALL_VERDICTS[row.id] = (key, verdict)
     return verdict
 

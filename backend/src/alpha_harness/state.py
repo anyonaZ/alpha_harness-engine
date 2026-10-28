@@ -10,11 +10,12 @@ import contextlib
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from typing import Any
 
 import structlog
 from sqlalchemy import select
 
-from . import preferences, resources, updates
+from . import compute, events, preferences, resources, updates
 from .account import AuthService, PlatformMetadata
 from .brain.client import BrainClient
 from .brain.endpoints import BrainEndpoints
@@ -83,7 +84,7 @@ class AppState:
             self.alphas,
             self.endpoints,
             self.tasks,
-            on_stored=lambda payload: self.hub.broadcast(TOPIC_SIMULATIONS, payload, replay=False),
+            on_stored=self._alpha_stored,
         )
         self.tracker = SimulationTracker(
             self.db,
@@ -123,6 +124,11 @@ class AppState:
         self._last_login_attempt = float("-inf")
         #: Set when startup could not read the saved session: BRAIN or the network was down.
         self._restore_pending = False
+
+    async def _alpha_stored(self, payload: dict[str, Any]) -> None:
+        # A trial waiting on this Alpha can be scored now.
+        events.bus.publish(events.STORED)
+        await self.hub.broadcast(TOPIC_SIMULATIONS, payload, replay=False)
 
     # -- lifecycle -------------------------------------------------------
 
@@ -305,6 +311,7 @@ class AppState:
         await self.tracker.stop()
         # Detached work reads and writes the stores closed below, so it goes first.
         await cancel_background()
+        compute.shutdown()
         await self.backfill.stop()
         await self.sync.shutdown()
         await self.client.aclose()

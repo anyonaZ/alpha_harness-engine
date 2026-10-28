@@ -4,7 +4,7 @@ A fork of Alpha Harness `v2026.10.24.1` that keeps every lab, tool and screen bu
 app's own CPU cost from growing with how long a task has run. BRAIN throughput is unchanged:
 eight slots, batches of ten, the same submission and recovery rules.
 
-Version: `2026.10.24.1+lean1`. The `+lean` label makes the updater report new upstream
+Version: `2026.10.24.1+lean2`. The `+lean` label makes the updater report new upstream
 releases without installing them by itself, since an upstream build would undo these changes.
 
 ## What changed
@@ -27,6 +27,30 @@ releases without installing them by itself, since an upstream build would undo t
 | Sidebar attention flash | Infinite | Three flashes |
 | Portfolio during a sync | Recomputed on every progress step | At most every 15 s, and once when the sync ends |
 | macOS window in the tray | `backgroundThrottling: disabled` | `throttle` |
+
+## Phase 3: structure
+
+| Area | Before | Lean |
+| --- | --- | --- |
+| Tracker | Woke every 1 s and queried the active rows, open or idle | Sleeps until the earliest Retry-After is due; with nothing to read, until a submission wakes it or the 60 s stale-send sweep |
+| Batch engine | A round every 2 s, open or idle | Every 2 s while work runs, is queued or is being read back; otherwise asleep until work is queued, a simulation settles or the quota resets |
+| Optimizer | Advanced every running task every 5 s | Advances when a simulation settles, an Alpha is stored or a task changes; 15 s safety tick (60 s with no task running) |
+| Event bus | none | `events.py`: `submitted`, `queued`, `settled`, `task_changed`, `stored`; coalescing, never authoritative (every loop still reads its state from disk) |
+| Active-set pushes | One per change | At most one a second, the last state always sent |
+| uvicorn housekeeping | Woke 10 times a second | Once a second in the app's entry point (`QuietServer`) |
+| Heavy arithmetic | Shared `asyncio.to_thread`'s pool at the process's priority | Its own threads (`compute.py`), as many as the profile's math threads, at `SCHED_IDLE` on Linux under Lean and Balanced; the event loop keeps its priority |
+| Portfolio, vault overview, submittable | Every request started its own run | Requests with the same inputs share one run (`singleflight.py`); a run nobody waits for any more is cancelled at its next step |
+| Search / Template refill memory | Reloaded and decoded every trial on each refill | Kept per task; only trials created or finished since are read, with a full reload every 25 refills (identical result, about a tenth of the time) |
+
+Not done as first planned, and why:
+
+- **A separate worker process** was replaced by low-priority compute threads. The sampler's
+  studies live in this process; a second interpreter would hold a second copy of numpy,
+  Optuna and DuckDB, and what is being bounded is CPU time, which a process boundary does not
+  reduce. Linux schedules threads individually, so `SCHED_IDLE` threads give the same
+  "runs only on spare CPU" behaviour.
+- **A counters table** for the task list was not needed: Phase 1's cache recounts a task only
+  when its counts by state change, which is exact and keeps repeat calls at about 40 ms.
 
 ## Resource profiles
 
@@ -64,6 +88,7 @@ A late task whose space is nearly all tried (60 fields, 10,000 trials): 8.36 s s
 on a repeat with no trial changed (what most pushes are).
 
 ```sh
+python3 bench/idle_bench.py --backend backend --entry --seconds 180 --threads
 cd backend
 uv run python ../bench/sampler_bench.py --trials 2000 10000 30000
 uv run python ../bench/sampler_bench.py --trials 10000 --fields 60 --narrow
@@ -85,11 +110,7 @@ the service or the desktop app, never both: they share `~/.alpha-harness`.
 
 ## Still to do
 
-- An event bus so the engine, tracker and optimizer wake on events instead of 1, 2 and 5 s
-  ticks (idle wake-ups).
-- A maintained counters table for the task list, replacing the cache.
-- A separate low-priority compute worker process for the sampler and portfolio math.
-- Single-flight guards on the Portfolio and vault endpoints.
 - Desktop notifications sent by the backend, so a hidden window needs no queries at all.
-- Incremental trial memory, so a refill stops reloading every trial.
-- A fake-BRAIN server for an hour-long end-to-end CPU test.
+- A fake-BRAIN server for an hour-long end-to-end CPU test with simulations running.
+- Result caching for the Portfolio until the vault changes (single-flight shares runs that
+  overlap, but a refresh after one ends still recomputes).
