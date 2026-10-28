@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import Field
 from sqlalchemy import select
 
-from . import updates
+from . import resources, updates
 from .brain.schemas import CheckResult
 from .db.models import Preference
 from .schemas import Out
@@ -46,13 +46,20 @@ class Preferences(Out):
     #: The model that writes Power Pool descriptions, as ``provider:model``; unset, the set-up
     #: model with the largest daily allowance.
     description_model: str | None = None
+    #: How much of this computer local work may use: threads, memory, CPU priority, sampler
+    #: time, keep-awake (``resources``). BRAIN throughput is the same in every profile. Kept
+    #: in the data folder rather than here, because it is read before the database opens.
+    resource_profile: resources.Profile = resources.DEFAULT
 
 
 async def load(db: Database) -> Preferences:
     """Every choice, defaults filled in. Rows a newer build wrote are ignored."""
     async with db.session() as session:
         rows = await session.scalars(select(Preference))
-        return Preferences.model_validate({row.key: row.value for row in rows})
+        saved = {row.key: row.value for row in rows}
+    # The file is the one source of truth for the profile, whatever an older row says.
+    saved["resource_profile"] = resources.current()
+    return Preferences.model_validate(saved)
 
 
 async def save(db: Database, preferences: Preferences) -> None:
@@ -72,3 +79,7 @@ def apply(state: AppState, preferences: Preferences) -> None:
     )
     updates.check_hours = preferences.update_check_hours
     updates.auto_install = preferences.auto_update
+    if preferences.resource_profile != resources.current():
+        # Keep-awake and the sampler read it as they go; DuckDB takes it from the caller
+        # (``api.preferences``); math threads and CPU priority on the next start.
+        resources.save(preferences.resource_profile)

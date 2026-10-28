@@ -14,9 +14,22 @@ export function useNow(every: number): number {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     if (every <= 0) return
-    setNow(Date.now())
-    const timer = setInterval(() => setNow(Date.now()), every)
-    return () => clearInterval(timer)
+    let timer: ReturnType<typeof setInterval> | null = null
+    // Paused while the page is hidden: nobody reads the clock, and a window kept in the tray
+    // would otherwise re-render every second for as long as the app runs.
+    const run = () => {
+      if (timer) clearInterval(timer)
+      timer = null
+      if (document.visibilityState === 'hidden') return
+      setNow(Date.now())
+      timer = setInterval(() => setNow(Date.now()), every)
+    }
+    run()
+    document.addEventListener('visibilitychange', run)
+    return () => {
+      document.removeEventListener('visibilitychange', run)
+      if (timer) clearInterval(timer)
+    }
   }, [every])
   return now
 }

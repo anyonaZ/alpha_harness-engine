@@ -4253,6 +4253,8 @@ export interface components {
             pnlDownload: boolean;
             /** Quickregions */
             quickRegions?: string[];
+            /** @default balanced */
+            resourceProfile: components["schemas"]["Profile"];
             /**
              * Updatecheckhours
              * @default 1
@@ -4296,6 +4298,8 @@ export interface components {
             /** Truncation */
             truncation?: number | null;
         };
+        /** @enum {string} */
+        Profile: "lean" | "balanced" | "max";
         /** PromptInfo */
         PromptInfo: {
             /** Body */

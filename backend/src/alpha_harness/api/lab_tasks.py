@@ -301,6 +301,9 @@ async def _one(state: Any, task_id: int) -> Study:
 #: Progress of complete tasks, which nothing changes once complete: by task, with the status,
 #: target and update time it was counted at, so a task extended or edited is counted again.
 _COMPLETE_PROGRESS: dict[int, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+#: The figures that need every trial's row, by task, with the counts by state they were read
+#: at: free answers, full runs, the best value and failure reasons.
+_COUNTED: dict[int, tuple[dict[str, int], dict[str, Any]]] = {}
 
 
 async def _progress(state: Any, rows: list[Study]) -> dict[int, dict[str, Any]]:
@@ -323,6 +326,7 @@ async def _progress(state: Any, rows: list[Study]) -> dict[int, dict[str, Any]]:
     value = func.json_extract(Trial.values, "$[0]")
     answered = Trial.state.in_([TrialState.COMPLETE, TrialState.FAIL])
     async with state.db.session() as session:
+        # Read off the (study, state) index alone, so it stays cheap at any size.
         states = await session.execute(
             select(Trial.study_id, Trial.state, func.count())
             .where(Trial.study_id.in_(ids))
@@ -330,41 +334,59 @@ async def _progress(state: Any, rows: list[Study]) -> dict[int, dict[str, Any]]:
         )
         for study_id, trial_state, n in states.all():
             out[study_id]["states"][str(trial_state)] = int(n)
-        # Three counts in one pass over the trials rather than one pass each.
-        counted = await session.execute(
-            select(
-                Trial.study_id,
-                func.count().filter(answered, Trial.message == scheduler.FREE),
-                func.count().filter(
-                    answered,
-                    or_(Trial.message.is_(None), Trial.message != scheduler.FREE),
-                    scheduler.full_run(),
-                ),
-                # An Alpha that returned no value is scored at the failure value, so it is not
-                # a best; nor is a seed, which was scored before the task began.
-                func.max(value).filter(
-                    Trial.state == TrialState.COMPLETE,
-                    value > FAILURE,
-                    or_(Trial.generation.is_(None), Trial.generation != 0),
-                ),
+        # The rest reads every trial's row. Its figures move only when a trial changes state,
+        # and the list is asked for again on every push, so a task whose counts by state are
+        # what they were last time keeps what was counted then.
+        counted_ids = list(ids)
+        ids = []
+        for study_id in counted_ids:
+            kept = _COUNTED.get(study_id)
+            if kept is not None and kept[0] == out[study_id]["states"]:
+                out[study_id].update(kept[1])
+            else:
+                ids.append(study_id)
+        if ids:
+            # Three counts in one pass over the trials rather than one pass each.
+            counted = await session.execute(
+                select(
+                    Trial.study_id,
+                    func.count().filter(answered, Trial.message == scheduler.FREE),
+                    func.count().filter(
+                        answered,
+                        or_(Trial.message.is_(None), Trial.message != scheduler.FREE),
+                        scheduler.full_run(),
+                    ),
+                    # An Alpha that returned no value is scored at the failure value, so it is not
+                    # a best; nor is a seed, which was scored before the task began.
+                    func.max(value).filter(
+                        Trial.state == TrialState.COMPLETE,
+                        value > FAILURE,
+                        or_(Trial.generation.is_(None), Trial.generation != 0),
+                    ),
+                )
+                .where(Trial.study_id.in_(ids))
+                .group_by(Trial.study_id)
             )
-            .where(Trial.study_id.in_(ids))
-            .group_by(Trial.study_id)
+            for study_id, free, full_runs, best in counted.all():
+                out[study_id]["free"] = int(free or 0)
+                out[study_id]["fullRuns"] = int(full_runs or 0)
+                out[study_id]["best"] = None if best is None else float(best)
+            failures = await session.execute(
+                select(Trial.study_id, Trial.message, func.count())
+                .where(Trial.study_id.in_(ids), Trial.state == TrialState.FAIL)
+                .group_by(Trial.study_id, Trial.message)
+            )
+            for study_id, message, n in failures.all():
+                found = out[study_id]["failures"]
+                found[_reason(message)] = found.get(_reason(message), 0) + int(n)
+    for study_id in ids:
+        progress = out[study_id]
+        _COUNTED[study_id] = (
+            dict(progress["states"]),
+            {k: progress[k] for k in ("free", "fullRuns", "best", "failures")},
         )
-        for study_id, free, full_runs, best in counted.all():
-            out[study_id]["free"] = int(free or 0)
-            out[study_id]["fullRuns"] = int(full_runs or 0)
-            out[study_id]["best"] = None if best is None else float(best)
-        failures = await session.execute(
-            select(Trial.study_id, Trial.message, func.count())
-            .where(Trial.study_id.in_(ids), Trial.state == TrialState.FAIL)
-            .group_by(Trial.study_id, Trial.message)
-        )
-        for study_id, message, n in failures.all():
-            found = out[study_id]["failures"]
-            found[_reason(message)] = found.get(_reason(message), 0) + int(n)
     for row in rows:
-        if row.id in ids and row.status == StudyStatus.COMPLETE:
+        if row.id in counted_ids and row.status == StudyStatus.COMPLETE:
             _COMPLETE_PROGRESS[row.id] = (_settled_key(row), out[row.id])
     return out
 

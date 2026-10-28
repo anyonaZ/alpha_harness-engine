@@ -24,8 +24,9 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 
+from .. import resources
 from ..brain.platform import IGNORED_CHECKS, QUOTA_CHECKS
 from ..brain.schemas import FULL_MODE, QUICK_MODE
 from ..db.models import (
@@ -453,11 +454,36 @@ class Optimizer:
 
     # -- optuna ----------------------------------------------------------
 
-    async def optuna_study(self, study_id: int, row: Study) -> optuna.Study:
-        """The Optuna study, rebuilt from the trial rows on first use."""
+    async def optuna_study(
+        self, study_id: int, row: Study, *, may_rebuild: bool = False
+    ) -> optuna.Study:
+        """The Optuna study, rebuilt from the trial rows on first use.
+
+        Rebuilt from a window of them — the best and the most recent, as the Resource profile
+        sets — rather than all: TPE reads every trial it holds on every ask, so a study that
+        kept them all cost more with each simulation the task ran (measured: 27 ms an ask at
+        500 trials, 431 ms at 10,000). The best keep what the search has learned of good
+        regions; the recent keep it from asking again what it just asked.
+
+        ``may_rebuild``: a study that has grown past the profile's ceiling in memory is
+        rebuilt the same way. Only the scheduler's ask passes it: a harvest holds live trials
+        of the study it has, and must tell them to that study.
+        """
+        budget = resources.budget()
         cached = self.studies.get(study_id)
         if cached is not None:
-            return cached
+            ceiling = budget.sampler_rebuild_at
+            if (
+                not may_rebuild
+                or ceiling is None
+                or len(cached.get_trials(deepcopy=False)) <= ceiling
+            ):
+                return cached
+            # The live trials belong to the study being dropped; their results reach the new
+            # one as replayed trials, as after a restart (``_tell_many``).
+            self.studies.pop(study_id, None)
+            self.open_trials.pop(study_id, None)
+            log.info("optimize.rebuild", study_id=study_id, trials=ceiling)
 
         async with self.db.session() as session:
             history = [
@@ -470,20 +496,16 @@ class Optimizer:
                 for params, distributions, values, state in (
                     await session.execute(
                         select(Trial.params, Trial.distributions, Trial.values, Trial.state)
-                        .where(Trial.study_id == study_id)
+                        .where(
+                            Trial.study_id == study_id,
+                            *history_window(study_id, budget.sampler_best, budget.sampler_recent),
+                        )
                         .order_by(Trial.number)
                     )
                 ).tuples()
             ]
 
-        from optuna.samplers import TPESampler
-
-        sampler = TPESampler(
-            n_startup_trials=params_of(row, SearchParams).n_startup_trials,
-            multivariate=True,
-            group=True,
-            constant_liar=row.batch_size > 1,
-        )
+        sampler = make_sampler(params_of(row, SearchParams).n_startup_trials, row.batch_size)
         loader = _Distributions(scheduler.field_slots(row))
         study = await asyncio.to_thread(_rebuild, sampler, history, loader)
         self.studies[study_id] = study
@@ -524,6 +546,49 @@ class Optimizer:
 
 
 # --- optuna plumbing, all synchronous ------------------------------------
+
+
+#: Trial states a rebuilt study replays (``_rebuild``).
+REPLAYED = (TrialState.COMPLETE, TrialState.FAIL, TrialState.PRUNED)
+
+
+def make_sampler(n_startup_trials: int, batch_size: int) -> Any:
+    """The Search and Template Labs' sampler, as it has always been configured."""
+    from optuna.samplers import TPESampler
+
+    return TPESampler(
+        n_startup_trials=n_startup_trials,
+        multivariate=True,
+        group=True,
+        constant_liar=batch_size > 1,
+    )
+
+
+def history_window(study_id: int, best: int | None, recent: int | None) -> list[Any]:
+    """SQL conditions keeping a task's best ``best`` scored trials and its ``recent`` most
+    recent replayable ones; none when both are ``None``, which keeps every trial."""
+    if best is None and recent is None:
+        return []
+    kept: list[Any] = []
+    if recent:
+        kept.append(
+            Trial.id.in_(
+                select(Trial.id)
+                .where(Trial.study_id == study_id, Trial.state.in_(REPLAYED))
+                .order_by(Trial.number.desc())
+                .limit(recent)
+            )
+        )
+    if best:
+        kept.append(
+            Trial.id.in_(
+                select(Trial.id)
+                .where(Trial.study_id == study_id, Trial.state == TrialState.COMPLETE)
+                .order_by(func.json_extract(Trial.values, "$[0]").desc())
+                .limit(best)
+            )
+        )
+    return [or_(*kept)]
 
 
 def _tell_many(

@@ -20,7 +20,7 @@
         "minHeight": 640,
         "center": true,
         "decorations": false,
-        "backgroundThrottling": "disabled"
+        "backgroundThrottling": "throttle"
       }
     ],
     "security": {

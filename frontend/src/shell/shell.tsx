@@ -11,6 +11,7 @@ import { today } from '@/api/core'
 import { errorMessage } from '@/api/http'
 import type { Today } from '@/api/types'
 import { useLive } from '@/lib/live'
+import { usePreferences } from '@/lib/preferences'
 import { useRefetchOn } from '@/lib/ws'
 import { Button, Empty, LINK, Notice, Skeleton, Spinner } from '@/ui/kit'
 import { ResizeHandle, useMediaQuery, WIDE } from '@/ui/panels'
@@ -22,7 +23,19 @@ import { SIDEBAR_WIDTH, Sidebar, useSidebarHidden } from './sidebar'
 import { SignIn } from './sign-in'
 import { InstallingOverlay } from './update'
 
+/** The Lean resource profile stills the UI's motion, as the system's reduced-motion setting
+ *  would: every animation is a repaint, and a laptop pays for each one. */
+function useProfileMotion() {
+  const profile = usePreferences().data?.resourceProfile
+  useEffect(() => {
+    const root = document.documentElement
+    if (profile === 'lean') root.setAttribute('data-motion', 'reduced')
+    else root.removeAttribute('data-motion')
+  }, [profile])
+}
+
 export function Shell() {
+  useProfileMotion()
   const query = useQuery({
     queryKey: ['today'],
     queryFn: () => today.get(),

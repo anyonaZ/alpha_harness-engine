@@ -22,6 +22,7 @@ import structlog
 from pydantic import ValidationError
 from sqlalchemy import delete, func, select, update
 
+from .. import resources
 from ..brain.errors import (
     BrainAuthError,
     BrainDailyLimitReached,
@@ -473,7 +474,11 @@ class BatchEngine:
             try:
                 await self.tick()
                 if rounds % AWAKE_TICKS == 0:
-                    self._awake.hold(self.keep_awake and await self._busy())
+                    budget = resources.budget()
+                    allowed = budget.awake_on_battery or not resources.on_battery()
+                    self._awake.hold(
+                        self.keep_awake and allowed and await self._busy(), budget.awake_what
+                    )
                 rounds += 1
             except Exception:
                 log.exception("engine.tick_failed")

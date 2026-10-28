@@ -111,18 +111,45 @@ function useLastSync() {
   return ((live ?? polled.data)?.tasks ?? []).filter((t) => t.kind === 'portfolio-sync').at(-1)
 }
 
+/** Least time between two recomputes while a sync is still landing PnL. */
+const SYNC_REFRESH_MS = 15_000
+
 /** Refreshes the page as a Portfolio sync lands PnL, and when it ends: no other job changes it,
- *  and every recompute reads every submitted Alpha's series. */
+ *  and every recompute reads every submitted Alpha's series. A sync reports up to fifty steps,
+ *  and a recompute per step piled correlation runs on top of each other, so while it runs the
+ *  page refreshes at most every 15 s; a sync starting or ending refreshes it at once. */
 function useRefreshOnSync() {
   const queryClient = useQueryClient()
   const sync = useLastSync()
-  const at = sync ? `${sync.id} ${sync.state} ${sync.progress}` : ''
-  const seen = useRef(at)
+  const phase = sync ? `${sync.id} ${sync.state}` : ''
+  const progress = sync?.progress ?? null
+  const seen = useRef({ phase, progress })
+  const last = useRef(0)
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => {
-    if (seen.current === at) return
-    seen.current = at
-    void queryClient.invalidateQueries({ queryKey: ['portfolio'] })
-  }, [at, queryClient])
+    const refresh = () => {
+      last.current = Date.now()
+      timer.current = null
+      void queryClient.invalidateQueries({ queryKey: ['portfolio'] })
+    }
+    const before = seen.current
+    seen.current = { phase, progress }
+    if (before.phase !== phase) {
+      if (timer.current) clearTimeout(timer.current)
+      refresh()
+      return
+    }
+    if (before.progress === progress) return
+    const since = Date.now() - last.current
+    if (since >= SYNC_REFRESH_MS) refresh()
+    else if (!timer.current) timer.current = setTimeout(refresh, SYNC_REFRESH_MS - since)
+  }, [phase, progress, queryClient])
+  useEffect(
+    () => () => {
+      if (timer.current) clearTimeout(timer.current)
+    },
+    [],
+  )
 }
 
 function useSyncTask() {

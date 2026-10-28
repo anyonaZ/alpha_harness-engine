@@ -8,12 +8,13 @@ dependency, so nothing constructs its own connections and shutdown is determinis
 import asyncio
 import contextlib
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
 import structlog
 from sqlalchemy import select
 
-from . import preferences, updates
+from . import preferences, resources, updates
 from .account import AuthService, PlatformMetadata
 from .brain.client import BrainClient
 from .brain.endpoints import BrainEndpoints
@@ -126,6 +127,15 @@ class AppState:
     # -- lifecycle -------------------------------------------------------
 
     async def startup(self) -> None:
+        # Local arithmetic yields to whatever the person is doing, and never takes more worker
+        # threads than the Resource profile allows. BRAIN calls are I/O and do not notice.
+        resources.lower_priority()
+        workers = resources.budget().executor_workers
+        if workers is not None:
+            asyncio.get_running_loop().set_default_executor(
+                ThreadPoolExecutor(max_workers=workers, thread_name_prefix="harness")
+            )
+        log.info("startup.resources", profile=resources.current(), workers=workers)
         # The catalog's single-writer lock is this process's claim on the data directory, so it
         # comes first: a second backend must fail here, before it backs up or migrates.
         await self.catalog.open()

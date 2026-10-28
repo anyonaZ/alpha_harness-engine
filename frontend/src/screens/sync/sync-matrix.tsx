@@ -24,8 +24,7 @@ type TileState = SyncMarket['state']
 /** Each Delay half, by state. Fetching sweeps an ink shimmer across; synced settles solid. */
 const HALF: Record<TileState, string> = {
   waiting: 'bg-surface-3',
-  fetching:
-    'animate-sweep bg-[length:200%_100%] bg-[linear-gradient(90deg,color-mix(in_srgb,var(--color-ink)_15%,transparent),color-mix(in_srgb,var(--color-ink)_70%,transparent),color-mix(in_srgb,var(--color-ink)_15%,transparent))]',
+  fetching: 'shimmer',
   fields: 'bg-ink-disabled',
   details: 'animate-pulse bg-ink-disabled ring-1 ring-ink ring-inset',
   done: 'bg-ink',

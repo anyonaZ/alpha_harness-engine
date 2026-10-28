@@ -373,24 +373,30 @@ def user_prompt(
 
 
 async def refill(optimizer: Optimizer, row: Study, want: int, waiting: bool) -> int:
+    proposed = (
+        Trial.study_id == row.id,
+        Trial.state == TrialState.PRUNED,
+        Trial.message == PROPOSED,
+    )
     async with optimizer.db.session() as session:
-        # Only the written Alphas still waiting to be sent, not the whole task.
-        ready = list(
-            (
-                await session.scalars(
-                    select(Trial)
-                    .where(
-                        Trial.study_id == row.id,
-                        Trial.state == TrialState.PRUNED,
-                        Trial.message == PROPOSED,
-                    )
-                    .order_by(Trial.number)
-                )
-            ).all()
+        # Only the written Alphas still waiting to be sent, and of those only the ones sent
+        # now are built: this runs every scheduler round, and the rest need only counting.
+        ready = int(
+            await session.scalar(select(func.count()).select_from(Trial).where(*proposed)) or 0
         )
-        batch = ready[:want] if want > 0 else []
+        batch = (
+            list(
+                (
+                    await session.scalars(
+                        select(Trial).where(*proposed).order_by(Trial.number).limit(want)
+                    )
+                ).all()
+            )
+            if want > 0
+            else []
+        )
         sent = await scheduler.send_parked(optimizer, row, batch) if batch else 0
-    left = len(ready) - sent
+    left = ready - sent
     llm = params_of(row, PowerPoolParams).llm
     calls = int(llm.get("calls") or 0)
     cap = max(3, 2 * -(-row.max_trials // PER_CALL))

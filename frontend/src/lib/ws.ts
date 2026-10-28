@@ -114,31 +114,53 @@ document.addEventListener('visibilitychange', () => {
  * Refetch queries under `queryKey` whenever `topic` reports a change. The socket is a signal,
  * not state, so a drifting payload shape can never desync the UI; bursts collapse to one
  * refetch per `minGapMs`, with a trailing call so the final state still lands.
+ *
+ * While the page is hidden (a window closed to the tray, a background tab) nothing is shown,
+ * so a push only notes that something changed and one refetch runs when the page is shown
+ * again. `hiddenGapMs` keeps a hidden page refetching, at that slower pace, for a reader that
+ * acts while hidden: desktop notifications of a task that ended.
  */
-export function useRefetchOn(topic: Topic, queryKey: readonly unknown[], minGapMs = 1000): void {
+export function useRefetchOn(
+  topic: Topic,
+  queryKey: readonly unknown[],
+  minGapMs = 1000,
+  hiddenGapMs = Number.POSITIVE_INFINITY,
+): void {
   const queryClient = useQueryClient()
   const last = useRef(0)
   const pending = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const missed = useRef(false)
   // Read when a message lands, so one subscription serves every render.
-  const latest = useRef({ queryKey, minGapMs })
+  const latest = useRef({ queryKey, minGapMs, hiddenGapMs })
   useEffect(() => {
-    latest.current = { queryKey, minGapMs }
+    latest.current = { queryKey, minGapMs, hiddenGapMs }
   })
 
   useEffect(() => {
+    const fire = () => {
+      last.current = Date.now()
+      pending.current = null
+      missed.current = false
+      void queryClient.invalidateQueries({ queryKey: latest.current.queryKey })
+    }
     const unsubscribe = telemetry.subscribe(topic, () => {
-      const fire = () => {
-        last.current = Date.now()
-        pending.current = null
-        void queryClient.invalidateQueries({ queryKey: latest.current.queryKey })
+      const hidden = document.visibilityState === 'hidden'
+      const gap = hidden ? latest.current.hiddenGapMs : latest.current.minGapMs
+      if (!Number.isFinite(gap)) {
+        missed.current = true
+        return
       }
-      const gap = latest.current.minGapMs
       const since = Date.now() - last.current
       if (since >= gap) fire()
       else if (!pending.current) pending.current = setTimeout(fire, gap - since)
     })
+    const shown = () => {
+      if (document.visibilityState === 'visible' && missed.current && !pending.current) fire()
+    }
+    document.addEventListener('visibilitychange', shown)
     return () => {
       unsubscribe()
+      document.removeEventListener('visibilitychange', shown)
       if (pending.current) clearTimeout(pending.current)
       pending.current = null
     }

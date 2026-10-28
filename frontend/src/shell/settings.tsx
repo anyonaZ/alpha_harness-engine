@@ -176,6 +176,21 @@ const AWAKE: Record<components['schemas']['EngineStatus']['awake'], string> = {
 
 const LIST_FORMAT = new Intl.ListFormat('en', { type: 'conjunction' })
 
+type Profile = components['schemas']['Profile']
+
+const PROFILES: { value: Profile; label: string }[] = [
+  { value: 'lean', label: 'Lean' },
+  { value: 'balanced', label: 'Balanced' },
+  { value: 'max', label: 'Max' },
+]
+
+const PROFILE_STATUS: Record<Profile, string> = {
+  lean: 'One thread for local arithmetic, lowest CPU priority, and the sampler thinks for at most a second a round. Keeps the computer awake only on mains power. Best for a laptop.',
+  balanced:
+    'Two threads for local arithmetic and a lower CPU priority; the sampler thinks for at most two seconds a round. Keeps the computer awake only on mains power.',
+  max: 'Every core for local arithmetic and the longest sampler budget, as the app ran before profiles. Keeps the computer awake on battery too.',
+}
+
 function SimulationRows({ current, change }: Rows) {
   const engine = useQuery({ queryKey: ['simulations', 'engine'], queryFn: simulations.engine })
   const awake = engine.data?.awake
@@ -188,6 +203,21 @@ function SimulationRows({ current, change }: Rows) {
   const quickAllowed = engine.data?.quickAllowed ?? true
   return (
     <>
+      <SettingRow
+        title="Resource profile"
+        description="How much of this computer the app's own arithmetic may use: the sampler, correlations, the catalog. BRAIN simulates just as fast in every profile. Threads and CPU priority change at the next start; the rest at once."
+        control={() => (
+          <Segmented
+            label="Resource profile"
+            items={PROFILES}
+            value={current.resourceProfile}
+            onChange={(profile) => change({ resourceProfile: profile })}
+          />
+        )}
+        stacked
+      >
+        <Status>{PROFILE_STATUS[current.resourceProfile]}</Status>
+      </SettingRow>
       <SettingRow
         title="Quick mode"
         description="Simulates with only the checks that score an Alpha, leaving out correlation, Theme and Competition. The figures are the same as in full, and a GLB batch finished 30% sooner. A Quick Alpha cannot be submitted, so each one that passes every check is simulated again in full, which costs one more simulation."
