@@ -145,9 +145,11 @@ async function notify(title: string, body: string) {
 export function DesktopNotifications() {
   // The same queries the Tasks page and the header read, so this costs nothing extra on screen.
   const tasks = useQuery({ queryKey: ['lab-tasks'], queryFn: labTasks.list })
-  useRefetchOn('studies', ['lab-tasks'], 2_000)
+  // Kept refetching while the window is in the tray, which is when a notice matters, but at a
+  // pace that costs nothing: a task's end is announced within half a minute.
+  useRefetchOn('studies', ['lab-tasks'], 2_000, 30_000)
   const engine = useQuery({ queryKey: ['simulations', 'engine'], queryFn: simulations.engine })
-  useRefetchOn('simulations', ['simulations', 'engine'], 2_000)
+  useRefetchOn('simulations', ['simulations', 'engine'], 2_000, 30_000)
   const update = useUpdateStatus()
 
   // Asked now, while the window is in front: macOS may hold back a prompt raised from the tray.

@@ -23,8 +23,12 @@ _ES_CONTINUOUS = 0x80000000
 _ES_SYSTEM_REQUIRED = 0x00000001
 
 
-def _command() -> list[str] | None:
-    """The process that holds the machine awake while it lives, or ``None``."""
+def _command(what: str) -> list[str] | None:
+    """The process that holds the machine awake while it lives, or ``None``.
+
+    ``what`` is systemd's list: ``sleep`` blocks suspend only, ``sleep:idle`` also the idle
+    actions (screen blanking, idle suspend). On macOS ``caffeinate -i`` is the first already.
+    """
     if sys.platform == "darwin":
         return ["caffeinate", "-i", "-w", str(os.getpid())]
     if sys.platform.startswith("linux") and "microsoft" not in platform.release().lower():
@@ -33,7 +37,7 @@ def _command() -> list[str] | None:
             # exits, and the lock goes with it.
             return [
                 "systemd-inhibit",
-                "--what=sleep:idle",
+                f"--what={what}",
                 "--who=Alpha Harness",
                 "--why=Simulations are pending",
                 "cat",
@@ -47,11 +51,15 @@ class StayAwake:
     def __init__(self) -> None:
         self.state: AwakeState = "idle"
         self._proc: subprocess.Popen[bytes] | None = None
+        #: What the lock in force blocks; a change of Resource profile takes a new one.
+        self._what: str | None = None
 
-    def hold(self, busy: bool) -> None:
+    def hold(self, busy: bool, what: str = "sleep:idle") -> None:
         if not busy:
             self.release()
             return
+        if self._what is not None and self._what != what:
+            self.release()
         if self.state == "held" and (self._proc is None or self._proc.poll() is None):
             return
         if self._proc is not None:
@@ -70,11 +78,13 @@ class StayAwake:
                 ok = ctypes.windll.kernel32.SetThreadExecutionState(
                     _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED
                 )
+                self._what = what
                 self.state = "held" if ok else "unavailable"
                 return
             # Narrowed in the positive branch, not by an early return on None: this is
             # unreachable on Windows, where pyrefly stops refining and reads the declared type.
-            cmd = _command()
+            cmd = _command(what)
+            self._what = what
             if cmd is None:
                 self.state = "unavailable"
             else:
@@ -104,6 +114,7 @@ class StayAwake:
         except Exception:
             log.warning("awake.release_failed", exc_info=True)
         self._proc = None
+        self._what = None
         self.state = "idle"
 
 

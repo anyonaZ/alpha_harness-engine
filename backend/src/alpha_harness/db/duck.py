@@ -20,6 +20,7 @@ import duckdb
 import pyarrow as pa
 import structlog
 
+from .. import resources
 from ..brain.platform import REGION_AGNOSTIC_REGION
 
 if TYPE_CHECKING:
@@ -359,8 +360,8 @@ class CatalogUnusableError(RuntimeError):
     """
 
 
-#: The share of the machine's memory the catalog may hold, and the share DuckDB takes unasked.
-MEMORY_SHARE = 0.25
+#: The share of the machine's memory DuckDB takes unasked; a Resource profile sets the share
+#: the catalog may hold instead (``resources.Budget.duckdb_memory_share``).
 DUCKDB_DEFAULT_SHARE = 0.8
 #: What DuckDB's error says, whatever its type, when the write-ahead log will not replay.
 WAL_UNREPLAYABLE = "Failure while replaying WAL"
@@ -443,15 +444,7 @@ class Catalog:
         # makes DuckDB download its time zone extension before loading the one built in, and
         # where the download is blocked the catalog does not open at all.
         self._conn.execute("SET GLOBAL TimeZone = 'UTC'")
-        # DuckDB keeps what it reads up to 80% of the machine's memory, which on a long run
-        # reads as a leak. Scaled from its own figure, in its own unit, so nothing here has to
-        # measure the machine; reset first so a reopen does not shrink it twice.
-        self._conn.execute("RESET GLOBAL memory_limit")
-        row = self._conn.execute("SELECT current_setting('memory_limit')").fetchone()
-        if row is not None:
-            amount, unit = str(row[0]).split()
-            share = float(amount) * MEMORY_SHARE / DUCKDB_DEFAULT_SHARE
-            self._conn.execute(f"SET GLOBAL memory_limit = '{share:.1f} {unit}'")
+        self._apply_budget_sync(resources.budget())
         self._conn.execute(SCHEMA)
         for table, column, kind in self._conn.execute(
             "SELECT table_name, column_name, data_type FROM duckdb_columns() "
@@ -489,6 +482,29 @@ class Catalog:
             return False
         self.fts = await self._locked(_load_fts, self._require())
         return self.fts
+
+    async def apply_budget(self, budget: resources.Budget) -> None:
+        """Take a Resource profile's threads and memory now, without reopening."""
+        if self._conn is not None:
+            await self._locked(self._apply_budget_sync, budget)
+
+    def _apply_budget_sync(self, budget: resources.Budget) -> None:
+        conn = self._require()
+        # DuckDB keeps what it reads up to 80% of the machine's memory, which on a long run
+        # reads as a leak. Scaled from its own figure, in its own unit, so nothing here has to
+        # measure the machine; reset first so a second call does not shrink it twice.
+        conn.execute("RESET GLOBAL memory_limit")
+        row = conn.execute("SELECT current_setting('memory_limit')").fetchone()
+        if row is not None:
+            amount, unit = str(row[0]).split()
+            share = float(amount) * budget.duckdb_memory_share / DUCKDB_DEFAULT_SHARE
+            conn.execute(f"SET GLOBAL memory_limit = '{share:.1f} {unit}'")
+        # DuckDB starts a worker per core and a long correlation read keeps them all busy; on
+        # a two-core laptop that is the whole machine.
+        if budget.duckdb_threads is None:
+            conn.execute("RESET GLOBAL threads")
+        else:
+            conn.execute(f"SET GLOBAL threads = {int(budget.duckdb_threads)}")
 
     async def execute(self, sql: str, params: list[Any] | None = None) -> None:
         """Run one statement. For DDL and small writes; bulk loads go through Arrow."""

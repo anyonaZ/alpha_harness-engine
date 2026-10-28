@@ -1,0 +1,34 @@
+# Alpha Harness Lean as a systemd user service: the backend runs in the background and the UI
+# opens in your own browser at http://localhost:8000. Installed by contrib/arch/install-lean.sh.
+#
+#   systemctl --user enable --now alpha-harness   start now and at every login
+#   systemctl --user stop alpha-harness            stop cleanly (DuckDB's lock is released)
+#   journalctl --user -u alpha-harness -f          follow the log
+#
+# Run either this service or the desktop app, never both: they share ~/.alpha-harness, and
+# DuckDB allows one writer.
+
+[Unit]
+Description=Alpha Harness Lean (WorldQuant BRAIN research studio)
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/alpha-harness
+# Set, so the app does not open a browser window on every start; open the page yourself.
+Environment=ALPHA_HARNESS_SHELL=systemd
+# The default profile until one is chosen in Settings (lean, balanced or max).
+Environment=HARNESS_PROFILE=lean
+# The kernel's own ceiling, whatever the code does: at most one and a half cores, idle I/O
+# priority, and memory pressure past 2 GB.
+CPUQuota=150%
+Nice=10
+IOSchedulingClass=idle
+MemoryHigh=2G
+# SIGTERM runs the app's normal shutdown, which closes both databases.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

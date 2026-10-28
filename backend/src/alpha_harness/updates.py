@@ -156,6 +156,14 @@ def is_release() -> bool:
     return parsed is not None and not parsed.is_devrelease
 
 
+def is_fork() -> bool:
+    """Whether this build carries changes of its own, marked by a local version label
+    (``2026.10.24.1+lean1``). Upstream's releases do not carry them, so installing one by
+    itself would quietly undo them; a fork is told of new releases and never auto-installs."""
+    parsed = _parse(current())
+    return parsed is not None and parsed.local is not None
+
+
 def launcher_version() -> str | None:
     """Which launcher started this app, when one did and it says so."""
     return os.environ.get(LAUNCHER_VARIABLE) or None
@@ -244,6 +252,7 @@ async def watch(
                 release is not None
                 and auto_install
                 and is_release()
+                and not is_fork()
                 and is_newer(release.version, current())
                 and launcher_home() is not None
                 and pending() is None

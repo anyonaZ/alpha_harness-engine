@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter
 
-from .. import preferences
+from .. import preferences, resources
 from ..preferences import Preferences
 from .deps import State
 
@@ -19,4 +19,5 @@ async def write(body: Preferences, state: State) -> Preferences:
     """Replace every choice. Each takes effect at once, not after a restart."""
     await preferences.save(state.db, body)
     preferences.apply(state, body)
+    await state.catalog.apply_budget(resources.budget())
     return body

@@ -8,11 +8,14 @@ only decides how one point of its search is drawn (its ``draw``).
 import asyncio
 import functools
 import json
+import random
+import time
 from typing import TYPE_CHECKING, Any
 
 import structlog
 from sqlalchemy import String, func, not_, or_, select, type_coerce, update
 
+from .. import resources
 from ..brain.platform import MULTI_SIMULATION_SIZE
 from ..brain.schemas import SimulationRequest, SimulationSettings, SimulationType
 from ..brain.settings_schema import validate_settings
@@ -276,12 +279,19 @@ def ask_points(
     seen: dict[tuple[str, str], float | bool],
     cover: list[str],
     schema: dict[str, Any] | None = None,
+    budget_seconds: float | None = None,
 ) -> tuple[list[tuple[Any, dict[str, Any], SimulationRequest]], str | None]:
     """Ask for ``want`` new simulations. Runs off the event loop.
 
     A point this task already scored is answered with its score, one that failed is told as
     failed, and a repeat, or a point its lab cannot write, is pruned; each time another
     point is asked, so quota is only spent on Alphas the task has not seen.
+
+    ``budget_seconds`` bounds the CPU the sampler may spend on this round (the Resource
+    profile's). Late in a long task most of what TPE asks is a repeat, and each ask reads the
+    study's whole history, so a round could cost minutes of a core. Past the budget the rest
+    of the round is drawn uniformly from points not tried yet and handed to the study as
+    fixed trials, which it records and learns from without sampling them.
 
     Also returns the first setting BRAIN refused, so a task left with nothing to ask can say
     whether BRAIN withdrew what it searches or the search ran out of new points.
@@ -297,8 +307,13 @@ def ask_points(
     picked: list[tuple[Any, dict[str, Any], SimulationRequest]] = []
     keys: set[tuple[str, str]] = set()
     withdrawn: str | None = None
+    started = time.thread_time()
+
+    def spent() -> bool:
+        return budget_seconds is not None and time.thread_time() - started > budget_seconds
+
     for _ in range(want * 5):
-        if len(picked) >= want:
+        if len(picked) >= want or spent():
             break
         trial = study.ask()
         params, request = lab.draw(trial, run, choices)
@@ -331,7 +346,69 @@ def ask_points(
             continue
         keys.add(key)
         picked.append((trial, params, request))
+    if len(picked) < want and spent():
+        _fill_uniformly(study, lab, run, want, seen, schema, choices, picked, keys)
     return picked, withdrawn
+
+
+class _Recorder:
+    """Stands in for an Optuna trial: draws uniformly and remembers what it drew, by name."""
+
+    def __init__(self, rng: random.Random) -> None:
+        self.rng = rng
+        self.params: dict[str, Any] = {}
+
+    def suggest_categorical(self, name: str, choices: Sequence[Any]) -> Any:
+        value = self.rng.choice(list(choices))
+        self.params[name] = value
+        return value
+
+
+def _fill_uniformly(
+    study: optuna.Study,
+    lab: Any,
+    run: SearchParams,
+    want: int,
+    seen: dict[tuple[str, str], float | bool],
+    schema: dict[str, Any] | None,
+    choices: Any,
+    picked: list[tuple[Any, dict[str, Any], SimulationRequest]],
+    keys: set[Any],
+) -> None:
+    """Top ``picked`` up to ``want`` with uniform draws the task has not tried.
+
+    Each draw is enqueued with every choice fixed, so ``study.ask`` neither samples it nor
+    reads the history; the trial is a real one, told its score like any other. Stops early
+    while the study holds trials someone else enqueued (the first pass's), which an ask
+    would hand out instead and sample in part.
+    """
+    from optuna.trial import TrialState as OptunaState
+
+    rng = random.Random()
+    for _ in range((want - len(picked)) * 20):
+        if len(picked) >= want:
+            return
+        if study.get_trials(deepcopy=False, states=(OptunaState.WAITING,)):
+            return
+        recorder = _Recorder(rng)
+        _, drawn = lab.draw(recorder, run, choices)
+        if drawn is None:
+            continue
+        if schema and validate_settings(schema, drawn.to_wire()["settings"]):
+            continue
+        key = search.identity_of(
+            drawn.regular, drawn.settings.model_dump(by_alias=True, exclude_none=True)
+        )
+        if key in keys or key in seen:
+            continue
+        study.enqueue_trial(recorder.params)
+        trial = study.ask()
+        params, request = lab.draw(trial, run, choices)
+        if request is None:
+            study.tell(trial, state=OptunaState.PRUNED)
+            continue
+        keys.add(key)
+        picked.append((trial, params, request))
 
 
 async def advance(optimizer: Optimizer, study_id: int) -> int:
@@ -471,10 +548,18 @@ async def advance(optimizer: Optimizer, study_id: int) -> int:
         untried = [f for f in coverable if f not in tried]
         cover = untried[: min(want, limit - len(tried))]
 
-    study = await optimizer.optuna_study(study_id, row)
+    study = await optimizer.optuna_study(study_id, row, may_rebuild=True)
     schema = await optimizer.metadata.cached_settings_schema()
     picked, withdrawn = await asyncio.to_thread(
-        ask_points, study, lab, run, want, seen, cover, schema
+        ask_points,
+        study,
+        lab,
+        run,
+        want,
+        seen,
+        cover,
+        schema,
+        resources.budget().sampler_seconds,
     )
     if not picked:
         # Nothing new left to ask: the task is done once what is out has come back.
@@ -588,21 +673,11 @@ async def _breed(
     optimizer: Optimizer, row: Study, last_number: int, want: int, waiting: bool
 ) -> int:
     """Evolution Lab's refill: children of the best Alphas so far, until the search stalls."""
-    async with optimizer.db.session() as session:
-        # Only what the stall check reads: spent children's scores, in the order asked.
-        spent_rows = (
-            await session.execute(
-                select(Trial.state, raw_json(Trial.values))
-                .where(
-                    Trial.study_id == row.id,
-                    Trial.generation > 0,
-                    _not_free(),
-                    Trial.state.in_([TrialState.COMPLETE, TrialState.FAIL]),
-                )
-                .order_by(Trial.number)
-            )
-        ).all()
-    if await asyncio.to_thread(lambda: ga.stalled(_spent(spent_rows))):
+    if want <= 0 and waiting:
+        # Nothing to breed and nothing to finish: a stalled task with work out waits for it
+        # anyway. Checked first, because this runs every scheduler round for every task.
+        return 0
+    if await _stalled(optimizer, row):
         if not waiting:
             await finish(optimizer, row.id, StudyStatus.COMPLETE, ga.STALLED)
         return 0
@@ -628,6 +703,39 @@ async def _breed(
     return await _queue(
         optimizer, row, last_number, [(None, params, req) for params, req in picked]
     )
+
+
+#: Per Evolution task: what its spent children were when last judged, and the verdict.
+_STALL_VERDICTS: dict[int, tuple[tuple[int, int], bool]] = {}
+
+
+async def _stalled(optimizer: Optimizer, row: Study) -> bool:
+    """:func:`ga.stalled` over the task's spent children, judged again only once one more has
+    been spent. A count and the last number say that from the index, without reading and
+    decoding every child's score each round."""
+    spent = (
+        Trial.study_id == row.id,
+        Trial.generation > 0,
+        _not_free(),
+        Trial.state.in_([TrialState.COMPLETE, TrialState.FAIL]),
+    )
+    async with optimizer.db.session() as session:
+        count, last = (
+            await session.execute(select(func.count(), func.max(Trial.number)).where(*spent))
+        ).one()
+        key = (int(count or 0), int(last if last is not None else -1))
+        kept = _STALL_VERDICTS.get(row.id)
+        if kept is not None and kept[0] == key:
+            return kept[1]
+        # Only what the stall check reads: spent children's scores, in the order asked.
+        spent_rows = (
+            await session.execute(
+                select(Trial.state, raw_json(Trial.values)).where(*spent).order_by(Trial.number)
+            )
+        ).all()
+    verdict = await asyncio.to_thread(lambda: ga.stalled(_spent(spent_rows)))
+    _STALL_VERDICTS[row.id] = (key, verdict)
+    return verdict
 
 
 def _spent(rows: Sequence[Any]) -> list[float | None]:
