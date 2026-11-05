@@ -56,6 +56,14 @@ def get(url: str, method: str = "GET") -> dict:
     return json.loads(body) if body else {}
 
 
+def maths(app_url: str) -> float | None:
+    """CPU seconds the compute pool has spent (Lean's ``/api/resources``), if it says."""
+    try:
+        return float(get(f"{app_url}/api/resources")["computeCpuSeconds"])
+    except OSError, KeyError, ValueError:
+        return None
+
+
 def wait_for(url: str) -> None:
     for _ in range(240):
         try:
@@ -119,20 +127,29 @@ def main() -> None:
             get(f"{app_url}/api/lab-tasks/run-all", method="POST")
             start_cpu, start_at = cpu_seconds(app.pid), time.monotonic()
             last_cpu, last_sims = start_cpu, 0
+            last_maths = maths(app_url)
             minutes: list[tuple[float, int]] = []
             print(
                 f"{backend.parent.name}: {args.seed_trials} trials seeded, "
                 f"{args.sim_seconds:.0f} s simulations, profile {args.profile}"
             )
-            print(f"{'minute':>6} {'CPU':>9} {'sims':>6}")
+            print(f"{'minute':>6} {'CPU':>9} {'maths':>9} {'sims':>6}")
             for minute in range(1, int(args.minutes) + 1):
                 time.sleep(60)
                 cpu, sims = cpu_seconds(app.pid), int(get(f"{brain_url}/__stats")["simulations"])
+                now_maths = maths(app_url)
+                share = (
+                    f"{(now_maths - last_maths) / 60 * 100:>8.1f}%"
+                    if now_maths is not None and last_maths is not None
+                    else f"{'-':>9}"
+                )
                 minutes.append((cpu - last_cpu, sims - last_sims))
                 print(
-                    f"{minute:>6} {(cpu - last_cpu) / 60 * 100:>8.1f}% {sims - last_sims:>6}",
+                    f"{minute:>6} {(cpu - last_cpu) / 60 * 100:>8.1f}% {share} "
+                    f"{sims - last_sims:>6}",
                     flush=True,
                 )
+                last_maths = now_maths
                 last_cpu, last_sims = cpu, sims
             stats = get(f"{brain_url}/__stats")
         finally:
