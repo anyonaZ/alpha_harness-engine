@@ -8,7 +8,7 @@ one core, and per thousand simulations, so builds that finish different amounts 
 The backend is pointed at the stand-in by a small launcher that sets ``API_BASE`` in memory
 before the app is imported: the app itself has no setting that redirects it, on purpose.
 
-    python3 bench/busy_bench.py --backend backend --minutes 20 --seed-trials 10000
+    backend/.venv/bin/python bench/busy_bench.py --backend backend --minutes 20 --seed-trials 10000
 """
 
 # ruff: noqa: T201 - a benchmark reports on stdout
