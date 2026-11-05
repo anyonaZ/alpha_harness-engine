@@ -6,20 +6,29 @@ page of the user's list), and each Alpha's daily PnL. A simulation takes ``--sim
 its Alpha's figures are drawn from a hash of the expression, so the same expression always
 scores the same. Anything else answers 404 and is counted, so a run shows what it skipped.
 
+A simulation finishes, and its Alpha exists, once its time is up whether or not anyone reads
+it, as on BRAIN: that is what lets the app adopt a send whose answer it lost. Every body sent
+is counted, and ``/__stats`` lists any sent twice. ``--post-delay`` holds each send open
+that long after BRAIN has it, the window in which a crash loses the answer.
+
 For benchmarks only: it never sees a password, and the app is pointed at it by
-``bench/busy_bench.py``, never by a setting.
+``bench/busy_bench.py`` or ``bench/recovery_check.py``, never by a setting.
 
     python bench/fake_brain.py --port 8899 --sim-seconds 30
 """
 
 import argparse
+import asyncio
 import hashlib
 import itertools
+import json
 import math
+import re
 import time
 from collections import Counter
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote
 
 import uvicorn
 from starlette.applications import Starlette
@@ -57,8 +66,13 @@ def _normal(text: str, salt: str) -> float:
 
 
 class Brain:
-    def __init__(self, sim_seconds: float) -> None:
+    def __init__(self, sim_seconds: float, post_delay: float = 0.0) -> None:
         self.sim_seconds = sim_seconds
+        self.post_delay = post_delay
+        #: Each simulation body as sent (canonical JSON) -> times sent.
+        self.sent: Counter[str] = Counter()
+        #: Sends BRAIN has but whose answer has not gone back yet.
+        self.posting = 0
         #: Simulation id -> (started, wire body, child ids or alpha id).
         self.sims: dict[str, dict[str, Any]] = {}
         self.alphas: dict[str, dict[str, Any]] = {}
@@ -70,19 +84,36 @@ class Brain:
     # -- simulations -------------------------------------------------------------------
 
     def create(self, body: Any) -> str:
-        now = time.monotonic()
+        now, wall = time.monotonic(), time.time()
+        for item in body if isinstance(body, list) else [body]:
+            self.sent[json.dumps(item, sort_keys=True)] += 1
         if isinstance(body, list):
             parent = _new_id("P")
             children = []
             for item in body:
                 child = _new_id("C")
-                self.sims[child] = {"started": now, "body": item, "alpha": None}
+                self.sims[child] = {"started": now, "wall": wall, "body": item, "alpha": None}
                 children.append(child)
             self.sims[parent] = {"started": now, "children": children}
             return parent
         sim = _new_id("S")
-        self.sims[sim] = {"started": now, "body": body, "alpha": None}
+        self.sims[sim] = {"started": now, "wall": wall, "body": body, "alpha": None}
         return sim
+
+    def settle(self) -> None:
+        """Finish every simulation whose time is up, read or not, as BRAIN does."""
+        now = time.monotonic()
+        for sim in self.sims.values():
+            if "children" in sim or sim["alpha"] is not None:
+                continue
+            if now - sim["started"] >= self.sim_seconds:
+                self._finish(sim)
+
+    def _finish(self, sim: dict[str, Any]) -> None:
+        sim["alpha"] = self._make_alpha(
+            sim["body"], datetime.fromtimestamp(sim["wall"] + self.sim_seconds, UTC)
+        )
+        self.finished += 1
 
     def read(self, sim_id: str) -> tuple[int, dict[str, Any], dict[str, str]]:
         sim = self.sims.get(sim_id)
@@ -98,8 +129,7 @@ class Brain:
         if "children" in sim:
             return 200, {"children": sim["children"], "status": "COMPLETE"}, {}
         if sim["alpha"] is None:
-            sim["alpha"] = self._make_alpha(sim["body"])
-            self.finished += 1
+            self._finish(sim)
         body = sim["body"]
         return (
             200,
@@ -116,7 +146,7 @@ class Brain:
 
     # -- alphas ------------------------------------------------------------------------
 
-    def _make_alpha(self, body: dict[str, Any]) -> str:
+    def _make_alpha(self, body: dict[str, Any], created: datetime) -> str:
         alpha_id = _new_id("A")
         code = str(body.get("regular") or "")
         settings = dict(body.get("settings") or {})
@@ -156,7 +186,7 @@ class Brain:
             },
             {"name": "SELF_CORRELATION", "result": "PENDING" if passing else "FAIL"},
         ]
-        now = datetime.now(UTC).isoformat()
+        now = created.isoformat()
         alpha = {
             "id": alpha_id,
             "type": "REGULAR",
@@ -220,6 +250,12 @@ class Brain:
 def build(brain: Brain) -> Starlette:
     async def create(request: Request) -> Response:
         sim_id = brain.create(await request.json())
+        if brain.post_delay:
+            brain.posting += 1
+            try:
+                await asyncio.sleep(brain.post_delay)
+            finally:
+                brain.posting -= 1
         base = str(request.base_url).rstrip("/")
         return Response(status_code=201, headers={"Location": f"{base}/simulations/{sim_id}"})
 
@@ -228,6 +264,7 @@ def build(brain: Brain) -> Starlette:
         return JSONResponse(body, status_code=status, headers=headers)
 
     async def alpha(request: Request) -> Response:
+        brain.settle()
         found = brain.alphas.get(request.path_params["alpha_id"])
         if found is None:
             return JSONResponse({"detail": "Not found."}, status_code=404)
@@ -240,12 +277,28 @@ def build(brain: Brain) -> Starlette:
         return JSONResponse(found)
 
     async def listing(request: Request) -> Response:
+        brain.settle()
         limit = int(request.query_params.get("limit", "100"))
         offset = int(request.query_params.get("offset", "0"))
-        newest = brain.order[::-1][offset : offset + limit]
-        return JSONResponse(
-            {"count": len(brain.order), "results": [brain.alphas[a] for a in newest]}
-        )
+        # ``dateCreated>=…`` and ``dateCreated<…`` are not key=value pairs: read them raw.
+        after = before = None
+        for token in request.url.query.split("&"):
+            bound = re.fullmatch(r"dateCreated(>=|<)(.+)", unquote(token))
+            if bound:
+                moment = datetime.fromisoformat(bound.group(2))
+                after, before = (moment, before) if bound.group(1) == ">=" else (after, moment)
+        rows = [brain.alphas[a] for a in brain.order]
+        rows.sort(key=lambda a: a["dateCreated"])
+        rows = [
+            a
+            for a in rows
+            if (after is None or datetime.fromisoformat(a["dateCreated"]) >= after)
+            and (before is None or datetime.fromisoformat(a["dateCreated"]) < before)
+        ]
+        if not request.query_params.get("order", "-dateCreated").lstrip().startswith("dateCreated"):
+            rows.reverse()
+        page = rows[offset : offset + limit]
+        return JSONResponse({"count": len(rows), "results": page})
 
     async def schema(_: Request) -> Response:
         # A settings tree with nothing to choose from: every value the app sends passes.
@@ -253,9 +306,13 @@ def build(brain: Brain) -> Starlette:
         return JSONResponse({"actions": {"POST": {"settings": {"children": {"decay": decay}}}}})
 
     async def stats(_: Request) -> Response:
+        brain.settle()
         return JSONResponse(
             {
                 "simulations": brain.finished,
+                "sent": sum(brain.sent.values()),
+                "sent_twice": {body: n for body, n in brain.sent.items() if n > 1},
+                "posting": brain.posting,
                 "alphas": len(brain.alphas),
                 "unknown": dict(brain.unknown.most_common(20)),
             }
@@ -287,9 +344,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8899)
     parser.add_argument("--sim-seconds", type=float, default=30.0)
+    parser.add_argument("--post-delay", type=float, default=0.0)
     args = parser.parse_args()
     uvicorn.run(
-        build(Brain(args.sim_seconds)), host="127.0.0.1", port=args.port, log_level="warning"
+        build(Brain(args.sim_seconds, args.post_delay)),
+        host="127.0.0.1",
+        port=args.port,
+        log_level="warning",
     )
 
 

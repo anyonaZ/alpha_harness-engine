@@ -3,11 +3,13 @@
 import os
 import sys
 import time
+from datetime import UTC, datetime
 from typing import Literal
 
 from fastapi import APIRouter
 
 from .. import compute, resources
+from .. import usage as usage_history
 from ..schemas import Out
 from .deps import State
 
@@ -15,6 +17,17 @@ router = APIRouter(prefix="/api/resources", tags=["resources"])
 
 #: When this process started, on the clock ``time.monotonic`` reads.
 _STARTED = time.monotonic()
+
+
+class HourUsage(Out):
+    """One clock hour of the last day."""
+
+    started_at: datetime
+    #: How much of the hour the backend was running: the first and current ones are partial.
+    seconds: float
+    cpu_seconds: float
+    #: Of which spent in the compute pool's jobs.
+    compute_cpu_seconds: float
 
 
 class ResourceUsage(Out):
@@ -37,6 +50,8 @@ class ResourceUsage(Out):
     nice: int | None
     cpus: int
     awake: Literal["held", "idle", "unavailable"]
+    #: CPU by clock hour over the last day, oldest first, the current hour so far last.
+    hours: list[HourUsage]
 
 
 @router.get("")
@@ -57,4 +72,13 @@ async def usage(state: State) -> ResourceUsage:
         nice=None if sys.platform == "win32" else os.getpriority(os.PRIO_PROCESS, 0),
         cpus=os.cpu_count() or 1,
         awake=state.engine.awake_state,
+        hours=[
+            HourUsage(
+                started_at=datetime.fromtimestamp(hour.start, UTC),
+                seconds=hour.seconds,
+                cpu_seconds=hour.cpu_seconds,
+                compute_cpu_seconds=hour.compute_cpu_seconds,
+            )
+            for hour in usage_history.history.hours()
+        ],
     )
