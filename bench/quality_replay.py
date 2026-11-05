@@ -39,7 +39,7 @@ from typing import Any
 import optuna
 from optuna.distributions import distribution_to_json
 from optuna.trial import TrialState
-from sampler_bench import RUN, Recorder, make_space, window
+from sampler_bench import RUN, Recorder, make_space, spread_window
 
 from alpha_harness.labs import scheduler, search, study
 
@@ -137,21 +137,6 @@ ARMS: dict[str, tuple[int, int, int, int] | None] = {
     "window": (500, 1500, 0, 2500),
     "spread": (500, 1500, 1000, 3500),
 }
-
-
-def spread_window(
-    rows: list[dict[str, Any]], best: int, recent: int, spread: int
-) -> list[dict[str, Any]]:
-    """``window`` plus every k-th older trial, ``spread`` of them: a thin, even record of
-    everything tried, so TPE still knows which regions were tried and found poor."""
-    kept = window(rows, best, recent)
-    if not spread:
-        return kept
-    replayed = [i for i, r in enumerate(rows) if r["state"] in ("COMPLETE", "FAIL", "PRUNED")]
-    older = replayed[:-recent] if recent else replayed
-    stride = max(1, -(-len(older) // spread))
-    chosen = {id(rows[i]) for i in older[::stride]} | {id(r) for r in kept}
-    return [r for r in rows if id(r) in chosen]
 
 
 def run_arm(
