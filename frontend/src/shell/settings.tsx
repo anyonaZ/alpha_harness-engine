@@ -339,7 +339,9 @@ const hourLabel = (hour: HourUsage) =>
 function HourBars({ hours }: { hours: HourUsage[] }) {
   const latest = hours.at(-1)
   if (!latest) return <span className="text-ink-subtle">Measuring…</span>
-  const top = Math.max(0.01, ...hours.map(hourShare))
+  const tallest = Math.max(...hours.map(hourShare))
+  // A floor for the scale only, so an idle day draws short bars rather than full ones.
+  const top = Math.max(0.01, tallest)
   const sampler = latest.cpuSeconds > 0 ? latest.computeCpuSeconds / latest.cpuSeconds : 0
   return (
     <div className="flex flex-col gap-1.5">
@@ -362,7 +364,8 @@ function HourBars({ hours }: { hours: HourUsage[] }) {
         ))}
       </div>
       <span className="text-ink-subtle text-body-compact tabular-nums">
-        {`This hour so far: ${fmt.pct(hourShare(latest))} of one core, ${fmt.pct(sampler)} of that the sampler and Portfolio maths. Tallest bar ${fmt.pct(top)}.`}
+        {`This hour so far: ${fmt.pct(hourShare(latest))} of one core, ${fmt.pct(sampler)} of that the sampler and Portfolio maths.`}
+        {hours.length > 1 && ` Busiest hour: ${fmt.pct(tallest)}.`}
       </span>
     </div>
   )
