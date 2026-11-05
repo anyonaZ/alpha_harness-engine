@@ -29,6 +29,7 @@ Pass: the window keeps at least 95% of all-history's hits and top-25 mean. Run f
 
 import argparse
 import hashlib
+import json
 import math
 import random
 import statistics
@@ -40,7 +41,6 @@ from optuna.distributions import distribution_to_json
 from optuna.trial import TrialState
 from sampler_bench import RUN, Recorder, make_space, window
 
-from alpha_harness import resources
 from alpha_harness.labs import scheduler, search, study
 
 BATCH = 10
@@ -130,21 +130,46 @@ def uniform_rows(
     return rows, truths
 
 
+#: What each arm learns from: best, latest, an even sample of the rest, and the size at which
+#: the study is rebuilt. ``None``: every trial, as upstream.
+ARMS: dict[str, tuple[int, int, int, int] | None] = {
+    "all": None,
+    "window": (500, 1500, 0, 2500),
+    "spread": (500, 1500, 1000, 3500),
+}
+
+
+def spread_window(
+    rows: list[dict[str, Any]], best: int, recent: int, spread: int
+) -> list[dict[str, Any]]:
+    """``window`` plus every k-th older trial, ``spread`` of them: a thin, even record of
+    everything tried, so TPE still knows which regions were tried and found poor."""
+    kept = window(rows, best, recent)
+    if not spread:
+        return kept
+    replayed = [i for i, r in enumerate(rows) if r["state"] in ("COMPLETE", "FAIL", "PRUNED")]
+    older = replayed[:-recent] if recent else replayed
+    stride = max(1, -(-len(older) // spread))
+    chosen = {id(rows[i]) for i in older[::stride]} | {id(r) for r in kept}
+    return [r for r in rows if id(r) in chosen]
+
+
 def run_arm(
     space: dict[str, Any],
     objective: Objective,
     start: list[dict[str, Any]],
     trials: int,
     seed: int,
-    windowed: bool,
+    arm: tuple[int, int, int, int] | None,
 ) -> dict[str, Any]:
-    budget = resources.BUDGETS["balanced"]
     slots = search.slots(space)
     loader = study._Distributions(slots)
     rows = list(start)
+    windowed = arm is not None
+    ceiling = arm[3] if arm else 0
 
     def build() -> optuna.Study:
-        kept = window(rows, budget.sampler_best, budget.sampler_recent) if windowed else rows
+        kept = spread_window(rows, *arm[:3]) if arm else rows
         # A rebuild is a new sampler, as in the app; the seed keeps runs repeatable.
         sampler = study.make_sampler(20, 80, seed=seed + len(rows))
         return study._rebuild(sampler, kept, loader)
@@ -156,7 +181,7 @@ def run_arm(
     truths: list[float] = []
     cpu = time.thread_time()
     while len(scores) < trials:
-        if windowed and len(built.get_trials(deepcopy=False)) > (budget.sampler_rebuild_at or 0):
+        if windowed and len(built.get_trials(deepcopy=False)) > ceiling:
             built = build()
         batch = []
         for _ in range(min(BATCH, trials - len(scores))):
@@ -192,9 +217,11 @@ def summary(arm: dict[str, Any], hit: float) -> dict[str, float]:
     scores, truths = arm["scores"], arm["truths"]
     n = len(scores)
     top = sorted(truths, reverse=True)[:25]
+    #: The last third of the run: where a sampler that lost what it learned would show it.
+    late = scores[n - n // 3 :]
     return {
         "hits": sum(1 for s in scores if s >= hit) / n * 1000,
-        "late_hits": sum(1 for s in scores[-n // 3 :] if s >= hit) / (n - 2 * n // 3) * 1000,
+        "late_hits": sum(1 for s in late if s >= hit) / len(late) * 1000,
         "top25": statistics.fmean(top),
         "best": top[0],
         "cpu": arm["cpu"],
@@ -206,52 +233,61 @@ def main() -> None:
     parser.add_argument("--trials", type=int, default=6000, help="points asked in the run")
     parser.add_argument("--start", type=int, default=0, help="uniform history before the run")
     parser.add_argument("--seeds", type=int, default=3)
+    parser.add_argument("--seed-from", type=int, default=1)
+    parser.add_argument("--arms", default="all,window", help=f"from {', '.join(ARMS)}")
     parser.add_argument("--fields", type=int, default=1500)
+    parser.add_argument("--out", help="also append each result as a JSON line here")
     args = parser.parse_args()
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     space = make_space(args.fields)
+    arms = args.arms.split(",")
 
     print(
         f"Search Lab task, {args.fields} fields, {args.start} trials before, "
         f"{args.trials} asked, batches of {BATCH}"
     )
     print(f"{'seed':>4} {'arm':>7} {'hits/1k':>8} {'late':>6} {'top-25':>7} {'best':>6} {'CPU':>7}")
-    totals: dict[str, list[dict[str, float]]] = {"all": [], "window": []}
-    for seed in range(1, args.seeds + 1):
+    totals: dict[str, list[dict[str, float]]] = {name: [] for name in arms}
+    for seed in range(args.seed_from, args.seed_from + args.seeds):
         objective = Objective(space, seed)
         # The hit line: the top 1% of what uniform sampling observes.
         probe, _ = uniform_rows(space, objective, 20000, seed=10_000 + seed)
         observed = sorted(r["values"][0] for r in probe if r["values"])
         hit = observed[int(len(observed) * 0.99)]
         start, _ = uniform_rows(space, objective, args.start, seed=seed) if args.start else ([], [])
-        for name, windowed in (("all", False), ("window", True)):
-            result = summary(run_arm(space, objective, start, args.trials, seed, windowed), hit)
+        for name in arms:
+            result = summary(run_arm(space, objective, start, args.trials, seed, ARMS[name]), hit)
             totals[name].append(result)
             print(
                 f"{seed:>4} {name:>7} {result['hits']:>8.1f} {result['late_hits']:>6.1f} "
                 f"{result['top25']:>7.3f} {result['best']:>6.3f} {result['cpu']:>6.0f}s",
                 flush=True,
             )
+            if args.out:
+                with open(args.out, "a") as out:  # noqa: PTH123
+                    out.write(json.dumps({"seed": seed, "arm": name, **result}) + "\n")
 
     mean = {
         name: {k: statistics.fmean(r[k] for r in rs) for k in rs[0]} for name, rs in totals.items()
     }
-    a, w = mean["all"], mean["window"]
-    print(
-        f"mean    all {a['hits']:>8.1f} {a['late_hits']:>6.1f} {a['top25']:>7.3f} "
-        f"{a['best']:>6.3f} {a['cpu']:>6.0f}s"
-    )
-    print(
-        f"mean window {w['hits']:>8.1f} {w['late_hits']:>6.1f} {w['top25']:>7.3f} "
-        f"{w['best']:>6.3f} {w['cpu']:>6.0f}s"
-    )
-    hits = w["hits"] / a["hits"] if a["hits"] else 1.0
-    top = w["top25"] / a["top25"] if a["top25"] else 1.0
-    verdict = "PASS" if hits >= 0.95 and top >= 0.95 else "FAIL"
-    print(
-        f"window / all: hits {hits:.1%}, top-25 mean {top:.1%}, "
-        f"CPU {w['cpu'] / a['cpu']:.0%} -> {verdict}"
-    )
+    for name, m in mean.items():
+        print(
+            f"mean {name:>6} {m['hits']:>8.1f} {m['late_hits']:>6.1f} {m['top25']:>7.3f} "
+            f"{m['best']:>6.3f} {m['cpu']:>6.0f}s"
+        )
+    if "all" not in mean:
+        return
+    a = mean["all"]
+    for name, m in mean.items():
+        if name == "all":
+            continue
+        hits = m["hits"] / a["hits"] if a["hits"] else 1.0
+        top = m["top25"] / a["top25"] if a["top25"] else 1.0
+        verdict = "PASS" if hits >= 0.95 and top >= 0.95 else "FAIL"
+        print(
+            f"{name} / all: hits {hits:.1%}, top-25 mean {top:.1%}, "
+            f"CPU {m['cpu'] / a['cpu']:.0%} -> {verdict}"
+        )
 
 
 if __name__ == "__main__":
