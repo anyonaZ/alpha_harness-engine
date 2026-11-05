@@ -90,6 +90,41 @@ def patch_categorical() -> None:
     _patched = True
 
 
+def _remembered_split(original: Callable[..., Any]) -> Callable[..., Any]:
+    """``_split_trials`` that answers a repeat of its last call from what it found then.
+
+    With ``group=True`` an ask samples each parameter group in turn, and each splits the same
+    trials into good and bad again: six times per ask on a Search Lab task. The split reads
+    only the trials and the count, so equal trials and count give the same split. Equality is
+    the list's own: the same trial objects compare by identity, others field by field.
+    """
+    # One tuple, read and replaced whole, so asks on two compute threads cannot mix theirs.
+    last: list[tuple[Any, list[Any], int, list[Any], list[Any]] | None] = [None]
+
+    def split(study: Any, trials: list[Any], n_below: int) -> tuple[list[Any], list[Any]]:
+        kept = last[0]
+        if kept is not None and kept[0] is study and kept[2] == n_below and kept[1] == trials:
+            return list(kept[3]), list(kept[4])
+        below, above = original(study, trials, n_below)
+        last[0] = (study, list(trials), n_below, list(below), list(above))
+        return below, above
+
+    split.__wrapped__ = original  # type: ignore[attr-defined]
+    return split
+
+
+def patch_split() -> None:
+    """Remember TPE's last trial split, for the groups of one ask. Idempotent."""
+    try:
+        from optuna.samplers._tpe import sampler as tpe  # pyright: ignore[reportPrivateUsage]
+    except ImportError:
+        return
+    current = getattr(tpe, "_split_trials", None)
+    if current is None or getattr(current, "__wrapped__", None) is not None:
+        return
+    tpe._split_trials = _remembered_split(current)  # pyright: ignore[reportPrivateUsage]
+
+
 def _incremental_groups() -> type | None:
     try:
         from optuna.search_space.group_decomposed import (
@@ -130,8 +165,9 @@ def _incremental_groups() -> type | None:
 
 
 def speed_up(sampler: Any) -> Any:
-    """Give a ``TPESampler`` both shortcuts; one whose internals differ is returned as is."""
+    """Give a ``TPESampler`` the shortcuts; one whose internals differ is returned as is."""
     patch_categorical()
+    patch_split()
     current = getattr(sampler, "_group_decomposed_search_space", None)
     groups = _incremental_groups()
     if current is not None and groups is not None:

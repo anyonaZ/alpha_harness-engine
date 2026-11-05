@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from fastapi import WebSocket
 
 log = structlog.get_logger(__name__)
@@ -33,11 +35,24 @@ class Hub:
         #: Last message per topic, replayed to a client on connect so a freshly opened
         #: tab shows current state immediately instead of waiting for the next change.
         self._latest: dict[str, dict[str, Any]] = {}
+        #: Topics whose current state is read fresh for each client that connects, so their
+        #: owners need not keep a snapshot up to date while no client is connected.
+        self._providers: dict[str, Callable[[], Awaitable[Any]]] = {}
+
+    def provide(self, topic: str, current: Callable[[], Awaitable[Any]]) -> None:
+        """Read ``topic``'s state with ``current`` for each client as it connects."""
+        self._providers[topic] = current
 
     async def connect(self, websocket: WebSocket) -> None:
         await websocket.accept()
         self._clients.add(websocket)
-        for message in list(self._latest.values()):
+        messages = [m for topic, m in self._latest.items() if topic not in self._providers]
+        for topic, current in list(self._providers.items()):
+            try:
+                messages.append({"topic": topic, "payload": await current()})
+            except Exception:
+                log.exception("hub.snapshot_failed", topic=topic)
+        for message in messages:
             with contextlib.suppress(Exception):
                 await websocket.send_text(json.dumps(message, default=str))
         log.debug("hub.connected", clients=len(self._clients))

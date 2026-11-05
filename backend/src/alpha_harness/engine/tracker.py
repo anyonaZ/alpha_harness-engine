@@ -13,6 +13,7 @@ it with the id the instant the response lands. A crash between the two leaves a
 import asyncio
 import contextlib
 import time
+from dataclasses import dataclass
 from datetime import UTC
 from typing import TYPE_CHECKING, Any
 
@@ -78,6 +79,15 @@ LOST = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _Polled:
+    """What a poll round needs of an active row."""
+
+    id: int
+    platform_id: str
+    progress: float | None
+
+
 class SimulationTracker:
     """Submits simulations, keeps their ids on disk, and polls them to completion."""
 
@@ -86,9 +96,10 @@ class SimulationTracker:
         db: Database,
         endpoints: BrainEndpoints,
         *,
-        on_change: Callable[[list[dict[str, Any]]], Awaitable[None]],
+        on_change: Callable[[list[dict[str, Any]] | None], Awaitable[None]],
         on_unauthorized: Callable[[], Awaitable[bool]],
         on_alpha: Callable[[str], Awaitable[None]],
+        listening: Callable[[], bool] = lambda: True,
     ) -> None:
         self.db = db
         self.endpoints = endpoints
@@ -100,6 +111,10 @@ class SimulationTracker:
         #: and its daily returns without anyone asking. Failures inside it never affect the
         #: simulation that produced the alpha.
         self._on_alpha = on_alpha
+        #: Whether anyone is watching the active set. With nobody to show it to, a push
+        #: hands ``on_change`` ``None`` instead of reading and serialising every row; a
+        #: screen that opens later asks for :meth:`snapshot` as it connects.
+        self._listening = listening
         self._task: asyncio.Task[None] | None = None
         #: Platform id -> monotonic time of its next allowed read, batch children included.
         #: In memory only; losing it just means one immediate read after a restart.
@@ -473,24 +488,47 @@ class SimulationTracker:
             )
             await self._wake.wait(max(MIN_SLEEP_SECONDS, sleep))
 
+    async def _polled(self) -> list[_Polled]:
+        """The active rows a tick may read, as the few columns it needs.
+
+        Not :meth:`active`: a tick runs every few seconds with eight batches out, and loading
+        their ninety-odd rows as whole records — request bodies and all — each time was most
+        of what the backend's main thread did. A row that finishes is loaded whole then.
+        """
+        async with self.db.session() as session:
+            rows = await session.execute(
+                select(
+                    SimulationRecord.id,
+                    SimulationRecord.platform_id,
+                    SimulationRecord.progress,
+                    SimulationRecord.is_batch,
+                    SimulationRecord.child_ids,
+                )
+                .where(
+                    SimulationRecord.status.in_([SimStatus.PENDING, SimStatus.RUNNING]),
+                    SimulationRecord.platform_id.is_not(None),
+                )
+                .order_by(SimulationRecord.created_at)
+            )
+            return [
+                _Polled(record_id, platform_id, progress)
+                for record_id, platform_id, progress, is_batch, child_ids in rows.tuples()
+                # Fanned out: the engine polls its children and finishes it.
+                if platform_id and not (is_batch and child_ids)
+            ]
+
     async def _tick(self) -> float | None:
         """One round of reads. Returns when the next read falls due, or ``None`` if none will."""
-        records = await self.active()
+        records = await self._polled()
         if not records:
             return None
 
         changed = False
         due: float | None = None
         for record in records:
-            platform_id = record.platform_id
-            if not platform_id:
-                continue
-            if record.is_batch and record.child_ids:
-                # Fanned out: the engine polls its children and finishes it.
-                continue
             if await self._poll_one(record):
                 changed = True
-            next_read = self._next_poll.get(platform_id)
+            next_read = self._next_poll.get(record.platform_id)
             if next_read is not None:
                 due = next_read if due is None else min(due, next_read)
 
@@ -498,10 +536,8 @@ class SimulationTracker:
             await self.notify()
         return due
 
-    async def _poll_one(self, record: SimulationRecord) -> bool:
+    async def _poll_one(self, record: _Polled) -> bool:
         """One status read, if one is due. Returns True if anything changed."""
-        if record.platform_id is None:
-            raise ValueError(f"simulation record {record.id} has no platform id to poll")
         read = await self.read(record.platform_id)
         if read is None:
             return False
@@ -524,9 +560,9 @@ class SimulationTracker:
                     )
                 return True
             case "fanout":
-                return await self._hand_over_children(record, outcome)
+                return await self._hand_over_children(record.id, outcome)
             case "gone" | "finished":
-                return await self._apply_terminal(record, outcome)
+                return await self._apply_terminal(record.id, outcome)
 
     async def read(self, platform_id: str) -> tuple[Outcome, dict[str, Any]] | None:
         """Read one simulation if a read is due: what it means, and the body it came in.
@@ -589,7 +625,7 @@ class SimulationTracker:
         self._failing_since.pop(platform_id, None)
         return True
 
-    async def _hand_over_children(self, record: SimulationRecord, outcome: Outcome) -> bool:
+    async def _hand_over_children(self, record_id: int, outcome: Outcome) -> bool:
         """A multi-simulation has dispatched its children: the engine reads them from here.
 
         A parent that says COMPLETE is done on BRAIN, children included, and finishes now.
@@ -605,7 +641,7 @@ class SimulationTracker:
         async with self.db.session() as session:
             won = await transition(
                 session,
-                record.id,
+                record_id,
                 from_=[SimStatus.RUNNING],
                 child_ids=list(outcome.children),
                 is_batch=True,
@@ -613,18 +649,21 @@ class SimulationTracker:
                 progress=1.0,
                 **finished,
             )
-        log.info("sim.fanned_out", record_id=record.id, children=len(outcome.children))
+        log.info("sim.fanned_out", record_id=record_id, children=len(outcome.children))
         events.bus.publish(events.SETTLED)
         return bool(won)
 
-    async def _apply_terminal(self, record: SimulationRecord, outcome: Outcome) -> bool:
+    async def _apply_terminal(self, record_id: int, outcome: Outcome) -> bool:
         """Write a finished simulation's outcome."""
         async with self.db.session() as session:
+            record = await session.get(SimulationRecord, record_id)
+            if record is None:
+                return False
             landed = await finish(session, record, outcome)
         events.bus.publish(events.SETTLED)
         log.info(
             "sim.finished",
-            record_id=record.id,
+            record_id=record_id,
             status=str(outcome.status),
             alpha_id=outcome.alpha_id,
         )
@@ -681,9 +720,13 @@ class SimulationTracker:
         await asyncio.sleep(wait)
         await self._push()
 
+    async def snapshot(self) -> list[dict[str, Any]]:
+        """The active set as the screens show it."""
+        return [serialise(r) for r in await self.active()]
+
     async def _push(self) -> None:
         self._last_notify = time.monotonic()
         try:
-            await self._on_change([serialise(r) for r in await self.active()])
+            await self._on_change(await self.snapshot() if self._listening() else None)
         except Exception:
             log.exception("tracker.notify_failed")
