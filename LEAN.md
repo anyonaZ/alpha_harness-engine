@@ -137,21 +137,27 @@ all-history's hits and top-25 mean.
 
 | Scenario, seeds | Learns from | Hits per 1,000 | Top-25 mean | Last-third hits | Sampler CPU |
 | --- | --- | --- | --- | --- | --- |
-NEWTASK_ROWS
+| New task: 6,000 trials, 8 seeds | every trial (upstream) | 58.2 | 1.393 | 44.9 | 227 s |
+| | **best 500 + latest 1,500** | **57.6 (98.9%)** | **1.382 (99.2%)** | 40.3 | 142 s |
+| | + 1,000 evenly sampled | 53.9 (92.6%) | 1.378 (98.9%) | 35.4 | 175 s |
 | Long task: 10,000 trials, then 3,000, 8 seeds | every trial (upstream) | 68.0 | 1.364 | 25.0 | 476 s |
-| | best 500 + latest 1,500 | 65.5 (96%) | 1.300 (95.3%) | 43.5 | 93 s |
-| | **+ 1,000 evenly sampled** | **75.0 (110%)** | **1.345 (98.6%)** | 43.6 | 131 s |
+| | **best 500 + latest 1,500** | **65.5 (96.3%)** | **1.300 (95.3%)** | 43.5 | 93 s |
+| | + 1,000 evenly sampled | 75.0 (110%) | 1.345 (98.6%) | 43.6 | 131 s |
 
-On three seeds the window alone failed the long-task gate (73% of hits), carried by one seed
-where learning from everything found a good region early. Eight seeds put it at the gate's
-edge. The window drops the record of what was tried long ago and found poor, which is what
-TPE's "bad" model learns from. So **Balanced now also keeps an even sample of 1,000 older
-trials** and is rebuilt past 3,500 (`sampler_spread`). Lean keeps the plain window (it is the
-cheapest choice); Max already keeps 5,000. Per-seed differences are large (a paired standard
-deviation of 19–30 hits per 1,000), so a few percent either way is noise.
+**The window passes both gates**, and is what every profile uses. The long task is the
+narrow one: on three seeds the window failed it (73% of hits), carried by one seed where
+learning from everything found a good region early, and eight seeds put it at 95.3% of the
+top-25 mean, just over the line.
 
-Under busy load (60 s simulations, 10,000-trial task, window open, 30 min) the sample costs
-about two points: 13.9% of a core on average, about 15% steady, against 13.1% without it.
+The window drops the record of what was tried long ago and found poor, which TPE's "bad"
+model learns from. So I tried keeping an even sample of 1,000 older trials as well
+(`sampler_spread`, rebuilt past 3,500). It did better on the long task (110% of hits, 98.6%
+of the top-25 mean) and worse on the new one (92.6% of hits, under the gate), and cost about
+two points of a core under busy load (13.9% against 13.1%). The long task starts from 10,000
+uniformly random trials, which flatters old history: a real task's old trials were chosen by
+TPE. So it stays a setting, off in every profile. Per-seed differences are large (a paired
+standard deviation of 9 to 30 hits per 1,000), so a few percent either way is noise; a task
+that has run for weeks is where to look if Search Lab ever seems to stall.
 
 ### Crash recovery (`bench/recovery_check.py`)
 
@@ -170,8 +176,7 @@ finds their Alphas in the account's listing and adopts them, nothing is sent twi
 
 ### An hour on a 20,000-trial task
 
-`busy_bench.py --minutes 60 --seed-trials 20000 --sim-seconds 60 --watch`, before the spread
-sample: 13.0% of a core over the hour, 101 CPU-s per 1,000 simulations, 4,639 simulations.
+`busy_bench.py --minutes 60 --seed-trials 20000 --sim-seconds 60 --watch`: 13.0% of a core over the hour, 101 CPU-s per 1,000 simulations, 4,639 simulations.
 Flat: 11.6%, 12.8%, 14.2%, 13.4%, 12.6% and 13.6% for each ten minutes.
 
 ### Ask cost at the extremes
@@ -184,8 +189,9 @@ CPU per ask of a refill, `sampler_bench.refill`, freshly built and at the rebuil
 | 50,000, 1,500 | 36 ms | 28 ms | 66 ms |
 | 10,000, 5,000 | 60 ms | 53 ms | 124 ms |
 | 50,000, 5,000 | 63 ms | 66 ms | 125 ms |
-| At the ceiling, 1,500 fields | 35 ms (2,500 held) | 61 ms (3,500 held) | 75 ms (6,000 held) |
-| At the ceiling, 5,000 fields | 69 ms | 98 ms | 146 ms |
+| At the ceiling, 1,500 fields | 35 ms (2,500 held) | 35 ms (2,500 held) | 75 ms (6,000 held) |
+| At the ceiling, 5,000 fields | 69 ms | 69 ms | 146 ms |
+| With the even sample on (3,500 held) | | 61 ms; 98 ms at 5,000 fields | |
 
 ### Kept running
 
@@ -216,8 +222,8 @@ the environment is the default when nothing was chosen there.
 | Nice | 10 | 5 | 0 |
 | Sampler budget per refill | 1 s | 2 s | 5 s |
 | Sampler share of a core, on average | 20% | 40% | no limit |
-| Sampler history | best 500 + latest 1,500 | best 500 + latest 1,500 + 1,000 evenly sampled | best 1,000 + latest 4,000 |
-| Study rebuilt past | 2,500 trials | 3,500 trials | 6,000 trials |
+| Sampler history (best + latest) | 500 + 1,500 | 500 + 1,500 | 1,000 + 4,000 |
+| Study rebuilt past | 2,500 trials | 2,500 trials | 6,000 trials |
 | Keep-awake | sleep only, on mains | sleep only, on mains | sleep and idle, always |
 | UI motion | reduced | normal | normal |
 
