@@ -120,6 +120,87 @@ backend/.venv/bin/python bench/busy_bench.py --backend backend --minutes 30 --si
 backend/.venv/bin/python bench/busy_bench.py --backend backend --minutes 30 --sim-seconds 60 --watch
 ```
 
+## Phase 6: the plan's acceptance gates
+
+The plan set five gates besides CPU: the sampler's search quality, crash recovery, an hour
+under load, ask cost at the extremes, and benchmarks that keep running. All are now measured,
+and the benchmarks behind them are in `bench/`.
+
+### Search quality (`bench/quality_replay.py`)
+
+One synthetic Search Lab task, run twice per seed with the same sampler and scoring, differing
+only in what the sampler learns from. Asked in batches of ten with the constant liar, as a
+slot's batch is. Scored by a hidden objective TPE can learn (some fields, operators, lookbacks
+and neutralizations are better; some fields pay only with one family; noise; 8% failures).
+**Hits** are points in the top 1% of what uniform sampling finds. Pass: 95% of
+all-history's hits and top-25 mean.
+
+| Scenario, seeds | Learns from | Hits per 1,000 | Top-25 mean | Last-third hits | Sampler CPU |
+| --- | --- | --- | --- | --- | --- |
+NEWTASK_ROWS
+| Long task: 10,000 trials, then 3,000, 8 seeds | every trial (upstream) | 68.0 | 1.364 | 25.0 | 476 s |
+| | best 500 + latest 1,500 | 65.5 (96%) | 1.300 (95.3%) | 43.5 | 93 s |
+| | **+ 1,000 evenly sampled** | **75.0 (110%)** | **1.345 (98.6%)** | 43.6 | 131 s |
+
+On three seeds the window alone failed the long-task gate (73% of hits), carried by one seed
+where learning from everything found a good region early. Eight seeds put it at the gate's
+edge. The window drops the record of what was tried long ago and found poor, which is what
+TPE's "bad" model learns from. So **Balanced now also keeps an even sample of 1,000 older
+trials** and is rebuilt past 3,500 (`sampler_spread`). Lean keeps the plain window (it is the
+cheapest choice); Max already keeps 5,000. Per-seed differences are large (a paired standard
+deviation of 19–30 hits per 1,000), so a few percent either way is noise.
+
+Under busy load (60 s simulations, 10,000-trial task, window open, 30 min) the sample costs
+about two points: 13.9% of a core on average, about 15% steady, against 13.1% without it.
+
+### Crash recovery (`bench/recovery_check.py`)
+
+`fake_brain.py` now finishes simulations on its own and creates their Alphas, as BRAIN does,
+counts every body sent, and can hold a send open (`--post-delay`). The check kills the backend
+with SIGKILL while BRAIN holds a ten-simulation batch whose id the backend never received,
+starts it again on the same data, and runs seven more minutes.
+
+| Build | Lost sends adopted | Queued again | Sent twice | Simulations in the 7 min after |
+| --- | --- | --- | --- | --- |
+| Upstream v2026.10.24.1 | 10 of 10 | 0 | 0 | 720 |
+| Lean | 10 of 10 | 0 | 0 | 940 |
+
+Recovery behaves as upstream's: the stale-send sweep marks the rows orphaned, the orphan pass
+finds their Alphas in the account's listing and adopts them, nothing is sent twice.
+
+### An hour on a 20,000-trial task
+
+`busy_bench.py --minutes 60 --seed-trials 20000 --sim-seconds 60 --watch`, before the spread
+sample: 13.0% of a core over the hour, 101 CPU-s per 1,000 simulations, 4,639 simulations.
+Flat: 11.6%, 12.8%, 14.2%, 13.4%, 12.6% and 13.6% for each ten minutes.
+
+### Ask cost at the extremes
+
+CPU per ask of a refill, `sampler_bench.refill`, freshly built and at the rebuild ceiling
+(the most a study holds before it is rebuilt). Gate: under 150 ms everywhere.
+
+| Trials, fields | Lean | Balanced | Max |
+| --- | --- | --- | --- |
+| 50,000, 1,500 | 36 ms | 28 ms | 66 ms |
+| 10,000, 5,000 | 60 ms | 53 ms | 124 ms |
+| 50,000, 5,000 | 63 ms | 66 ms | 125 ms |
+| At the ceiling, 1,500 fields | 35 ms (2,500 held) | 61 ms (3,500 held) | 75 ms (6,000 held) |
+| At the ceiling, 5,000 fields | 69 ms | 98 ms | 146 ms |
+
+### Kept running
+
+`lefthook run check`, and so CI, now lints `bench/` and runs `tpe_equivalence.py` on 1,000
+trials: it fails if the app's sampler asks anything Optuna's would not, or if the shortcuts
+stop saving at least 15% (they save about 45%). The longer benchmarks need minutes and a
+stand-in server, so they stay manual; their commands are above.
+
+### CPU by the hour
+
+Settings → Resources has a **By hour** row: one bar per clock hour over the last day, and this
+hour so far with the sampler's part (`usage.py`, read every five minutes; `hours` in
+`GET /api/resources`). The plan asked for this so the budget can be checked without
+watching the panel.
+
 ## Resource profiles
 
 Settings → Simulations → **Resource profile**. Threads and CPU priority take effect at the next
@@ -135,8 +216,8 @@ the environment is the default when nothing was chosen there.
 | Nice | 10 | 5 | 0 |
 | Sampler budget per refill | 1 s | 2 s | 5 s |
 | Sampler share of a core, on average | 20% | 40% | no limit |
-| Sampler history (best + latest) | 500 + 1,500 | 500 + 1,500 | 1,000 + 4,000 |
-| Study rebuilt past | 2,500 trials | 2,500 trials | 6,000 trials |
+| Sampler history | best 500 + latest 1,500 | best 500 + latest 1,500 + 1,000 evenly sampled | best 1,000 + latest 4,000 |
+| Study rebuilt past | 2,500 trials | 3,500 trials | 6,000 trials |
 | Keep-awake | sleep only, on mains | sleep only, on mains | sleep and idle, always |
 | UI motion | reduced | normal | normal |
 
@@ -198,7 +279,5 @@ in the background.
 
 ## Still to do
 
-- A Resources history: today the panel shows the last five seconds and the average since
-  start, not a chart over the day.
 - Upstream pull requests to residual-lab/alpha-harness, one per change, if its maintainers
   want them.
