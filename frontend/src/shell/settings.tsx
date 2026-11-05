@@ -9,6 +9,7 @@ import {
   CheckIcon,
   CpuIcon,
   DownloadIcon,
+  GaugeIcon,
   LayersIcon,
   ListChecksIcon,
   LoaderCircleIcon,
@@ -19,17 +20,28 @@ import {
 import { type ReactNode, useEffect, useId, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { create } from 'zustand'
-import { type Preferences, simulations, update } from '@/api/core'
+import {
+  type Preferences,
+  type ResourceUsage,
+  resourceUsage,
+  simulations,
+  update,
+} from '@/api/core'
 import type { components } from '@/api/generated'
 import { errorMessage } from '@/api/http'
 import { REGION_AGNOSTIC_REGION, SIMULATION_SLOTS } from '@/api/platform'
 import { fmt } from '@/lib/format'
+import {
+  askNotificationPermission,
+  browserNotifications,
+  useNotificationPermission,
+} from '@/lib/notices'
 import { usePreferences, useSavePreferences } from '@/lib/preferences'
 import { DEFAULT_SCOPE, useScopeOptions } from '@/lib/scope'
 import { useProviderLabel, useRunnableModels } from '@/screens/ai/shared'
 import { Button, Chips, ErrorNotice, Segmented, Skeleton, Switch } from '@/ui/kit'
 import { BACKDROP, Select } from '@/ui/overlay'
-import { MOD } from './desktop'
+import { inDesktop, MOD } from './desktop'
 import { useApplyUpdate, useUpdateStatus } from './update'
 
 export const useSettings = create<{
@@ -42,10 +54,11 @@ export const useSettings = create<{
 
 export const SETTINGS_SHORTCUT = `${MOD},`
 
-type SectionId = 'simulations' | 'tasks' | 'alphas' | 'updates'
+type SectionId = 'simulations' | 'resources' | 'tasks' | 'alphas' | 'updates'
 
 const SECTIONS: { id: SectionId; label: string; icon: LucideIcon }[] = [
   { id: 'simulations', label: 'Simulations', icon: CpuIcon },
+  { id: 'resources', label: 'Resources', icon: GaugeIcon },
   { id: 'tasks', label: 'Tasks', icon: ListChecksIcon },
   { id: 'alphas', label: 'Alphas', icon: LayersIcon },
   { id: 'updates', label: 'Updates', icon: RefreshCwIcon },
@@ -124,6 +137,8 @@ export function SettingsDialog() {
 
 const ABOUT: Record<SectionId, string> = {
   simulations: 'How simulations run, share the eight cores, and keep going through the day.',
+  resources:
+    "How much of this computer the app's own work may use, and what it is using now. BRAIN's simulations run on BRAIN and cost nothing here.",
   tasks: 'What a new task in any lab or tool starts with.',
   alphas:
     'What is kept on this computer as Alphas come back from BRAIN, and which model writes their descriptions.',
@@ -148,6 +163,8 @@ function Section({ id }: { id: SectionId }) {
           <Skeleton className="h-14" label="Loading settings" />
         ) : id === 'simulations' ? (
           <SimulationRows current={current} change={change} />
+        ) : id === 'resources' ? (
+          <ResourceRows current={current} change={change} />
         ) : id === 'tasks' ? (
           <TaskRows current={current} change={change} />
         ) : id === 'alphas' ? (
@@ -191,16 +208,20 @@ const PROFILE_STATUS: Record<Profile, string> = {
   max: 'Every core for local arithmetic and the longest sampler budget, as the app ran before profiles. Keeps the computer awake on battery too.',
 }
 
-function SimulationRows({ current, change }: Rows) {
-  const engine = useQuery({ queryKey: ['simulations', 'engine'], queryFn: simulations.engine })
-  const awake = engine.data?.awake
-  // Region-agnostic runs are scored as a family of regions, which Quick mode has not been
-  // tried against, so only single regions are offered.
-  const regions = useScopeOptions(DEFAULT_SCOPE).regions.filter(
-    (r) => r.value !== REGION_AGNOSTIC_REGION,
-  )
-  const quick = current.quickRegions ?? []
-  const quickAllowed = engine.data?.quickAllowed ?? true
+// ── Resources ────────────────────────────────────────────────────────────────────────────
+
+/** How often the panel reads usage while it is open: a rate needs two readings. */
+const USAGE_POLL_MS = 5000
+
+const PRIORITY: Record<ResourceUsage['computePriority'], string> = {
+  idle: 'lowest (runs only on CPU time nothing else wants)',
+  lowered: 'lowered by 10 steps',
+  refused: 'unchanged: the system refused to lower it',
+  unchanged: 'unchanged on this system; the thread count still bounds it',
+  pending: 'set when the first job runs',
+}
+
+function ResourceRows({ current, change }: Rows) {
   return (
     <>
       <SettingRow
@@ -218,6 +239,104 @@ function SimulationRows({ current, change }: Rows) {
       >
         <Status>{PROFILE_STATUS[current.resourceProfile]}</Status>
       </SettingRow>
+      <UsageRow />
+    </>
+  )
+}
+
+/** The share of one core spent between two readings, or over the whole run with no earlier one. */
+function coreShare(
+  now: ResourceUsage,
+  before: ResourceUsage | null,
+  pick: (u: ResourceUsage) => number,
+) {
+  if (!before || now.readAt <= before.readAt) return null
+  return Math.max(0, (pick(now) - pick(before)) / (now.readAt - before.readAt))
+}
+
+function UsageRow() {
+  const usage = useQuery({
+    queryKey: ['resources'],
+    queryFn: resourceUsage.get,
+    refetchInterval: USAGE_POLL_MS,
+  })
+  const [readings, setReadings] = useState<{
+    now: ResourceUsage
+    before: ResourceUsage | null
+  } | null>(null)
+  useEffect(() => {
+    const data = usage.data
+    if (!data) return
+    setReadings((last) =>
+      last?.now.readAt === data.readAt ? last : { now: data, before: last?.now ?? null },
+    )
+  }, [usage.data])
+
+  const now = readings?.now
+  const recent = now ? coreShare(now, readings.before, (u) => u.processCpuSeconds) : null
+  const recentCompute = now ? coreShare(now, readings.before, (u) => u.computeCpuSeconds) : null
+  const average = now && now.uptimeSeconds > 0 ? now.processCpuSeconds / now.uptimeSeconds : null
+  return (
+    <SettingRow
+      title="Using now"
+      description="What the app itself is costing this computer, measured by the system. 100% is one core kept fully busy."
+      control={() => null}
+      stacked
+    >
+      {usage.isError ? (
+        <ErrorNotice error={usage.error} title="Usage could not be read" />
+      ) : !now ? (
+        <Skeleton className="h-24" label="Reading usage" />
+      ) : (
+        <dl className="grid grid-cols-[max-content_1fr] gap-x-6 gap-y-1.5 text-body-compact">
+          <dt className="text-ink-subtle">Last {USAGE_POLL_MS / 1000} seconds</dt>
+          <dd className="text-ink tabular-nums">
+            {recent === null
+              ? 'Measuring…'
+              : `${fmt.pct(recent)} of one core, ${fmt.pct(recentCompute ?? 0)} of it the sampler and Portfolio maths`}
+          </dd>
+          <dt className="text-ink-subtle">Since it started</dt>
+          <dd className="text-ink tabular-nums">
+            {`${fmt.pct(average)} of one core on average over ${fmt.duration(now.uptimeSeconds)}; ${fmt.duration(now.processCpuSeconds)} of CPU in all`}
+          </dd>
+          <dt className="text-ink-subtle">Maths threads</dt>
+          <dd className="text-ink tabular-nums">
+            {now.computeThreads === null
+              ? `none yet; ${PRIORITY.pending}`
+              : `${now.computeThreads} of ${now.cpus}, priority ${PRIORITY[now.computePriority]}`}
+          </dd>
+          <dt className="text-ink-subtle">numpy and DuckDB</dt>
+          <dd className="text-ink tabular-nums">
+            {`${now.mathThreads ?? 'every'} and ${now.duckdbThreads ?? 'every'} thread${now.duckdbThreads === 1 ? '' : 's'}`}
+          </dd>
+          {now.nice !== null && (
+            <>
+              <dt className="text-ink-subtle">CPU priority</dt>
+              <dd className="text-ink tabular-nums">
+                {now.nice > 0 ? `nice ${now.nice}: yields to other programs` : 'normal'}
+              </dd>
+            </>
+          )}
+          <dt className="text-ink-subtle">Keep awake</dt>
+          <dd className="text-ink">{AWAKE[now.awake]}</dd>
+        </dl>
+      )}
+    </SettingRow>
+  )
+}
+
+function SimulationRows({ current, change }: Rows) {
+  const engine = useQuery({ queryKey: ['simulations', 'engine'], queryFn: simulations.engine })
+  const awake = engine.data?.awake
+  // Region-agnostic runs are scored as a family of regions, which Quick mode has not been
+  // tried against, so only single regions are offered.
+  const regions = useScopeOptions(DEFAULT_SCOPE).regions.filter(
+    (r) => r.value !== REGION_AGNOSTIC_REGION,
+  )
+  const quick = current.quickRegions ?? []
+  const quickAllowed = engine.data?.quickAllowed ?? true
+  return (
+    <>
       <SettingRow
         title="Quick mode"
         description="Simulates with only the checks that score an Alpha, leaving out correlation, Theme and Competition. The figures are the same as in full, and a GLB batch finished 30% sooner. A Quick Alpha cannot be submitted, so each one that passes every check is simulated again in full, which costs one more simulation."
@@ -283,19 +402,57 @@ const CORES = Array.from({ length: SIMULATION_SLOTS }, (_, i) => ({
 
 function TaskRows({ current, change }: Rows) {
   return (
+    <>
+      <SettingRow
+        title="Default cores for new tasks"
+        description="Every lab and tool starts a new task with this many cores. Change the cores in a lab's own form to use a different number there; that form then keeps its own choice."
+        control={() => (
+          <Segmented
+            label="Default cores for new tasks"
+            items={CORES}
+            value={current.defaultCores}
+            onChange={(cores) => change({ defaultCores: cores })}
+          />
+        )}
+        stacked
+      />
+      {!inDesktop && browserNotifications && <BrowserNotificationRow />}
+    </>
+  )
+}
+
+const PERMISSION_STATUS: Record<NotificationPermission, string> = {
+  granted: 'On: this tab notifies you while it is in the background.',
+  default: 'Off: this browser has not been asked yet.',
+  denied:
+    "Blocked in this browser's site settings for this page. Allow notifications there, then reload.",
+}
+
+/** In a browser tab, the desktop app's notices: a task ending, the daily limit, a lost session. */
+function BrowserNotificationRow() {
+  const permission = useNotificationPermission()
+  const [asking, setAsking] = useState(false)
+  return (
     <SettingRow
-      title="Default cores for new tasks"
-      description="Every lab and tool starts a new task with this many cores. Change the cores in a lab's own form to use a different number there; that form then keeps its own choice."
-      control={() => (
-        <Segmented
-          label="Default cores for new tasks"
-          items={CORES}
-          value={current.defaultCores}
-          onChange={(cores) => change({ defaultCores: cores })}
-        />
-      )}
-      stacked
-    />
+      title="Notify me in this browser"
+      description="A system notification when a task finishes, pauses or fails, when BRAIN's daily limit is reached, or when BRAIN stops accepting your session, while this tab is in the background. Keep the tab open; it may be minimised."
+      control={(labels) =>
+        permission === 'default' ? (
+          <Button
+            {...labels}
+            loading={asking}
+            onClick={() => {
+              setAsking(true)
+              void askNotificationPermission().finally(() => setAsking(false))
+            }}
+          >
+            Allow notifications
+          </Button>
+        ) : null
+      }
+    >
+      {permission !== 'unsupported' && <Status>{PERMISSION_STATUS[permission]}</Status>}
+    </SettingRow>
   )
 }
 

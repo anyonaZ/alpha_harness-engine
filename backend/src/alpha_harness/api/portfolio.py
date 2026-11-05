@@ -11,7 +11,7 @@ from ..brain.platform import REGION_AGNOSTIC_CLASS, TRADING_DAYS
 from ..brain.settings_schema import chosen_labels
 from ..labs.fastexpr import ParseError, data_fields, parse
 from ..schemas import Out
-from ..singleflight import SingleFlight
+from ..singleflight import Kept
 from ..tools import portfolio, power_pool
 from ..vault.store import SERIES_VERSION, json_list
 from ..vault.yields import checks_of, limits_of
@@ -303,8 +303,9 @@ def _pnl_version(row: dict[str, Any]) -> Any:
     return row.get("series_version") if version is None else version
 
 
-#: Requests for the same figures share one run (``singleflight``).
-_flights = SingleFlight()
+#: Requests for the same figures share one run, and its answer is kept until the vault is
+#: written to (``singleflight``).
+_kept = Kept()
 
 
 @router.get("/members")
@@ -314,7 +315,11 @@ async def members(
 ) -> PortfolioMembers:
     """Every submitted Alpha stored locally. With ``costBps``, its figures and correlations are
     worked out on its daily PnL net of that cost instead of read from BRAIN."""
-    return await _flights.run(("members", cost_bps), lambda: _members(state, cost_bps))
+    return await _kept.get(
+        ("members", cost_bps),
+        lambda: state.catalog.version,
+        lambda: _members(state, cost_bps),
+    )
 
 
 async def _members(state: Any, cost_bps: float | None) -> PortfolioMembers:
@@ -465,8 +470,10 @@ async def markdown(body: CopyRequest, state: State) -> CopiedAlphas:
 async def compute(body: PortfolioRequest, state: State) -> PortfolioResult:
     """These Alphas combined at equal weight: stats, yearly rows, partitions, correlations."""
     ids = list(dict.fromkeys(body.alpha_ids))
-    return await _flights.run(
-        ("compute", tuple(ids), body.cost_bps), lambda: _compute(state, ids, body.cost_bps)
+    return await _kept.get(
+        ("compute", tuple(ids), body.cost_bps),
+        lambda: state.catalog.version,
+        lambda: _compute(state, ids, body.cost_bps),
     )
 
 

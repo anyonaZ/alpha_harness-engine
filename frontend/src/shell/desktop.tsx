@@ -1,16 +1,14 @@
 /**
  * Inside the desktop app only: system notifications for what happens while the window is out of
- * sight — a task ending, BRAIN's daily limit, a lost session, an update to install. Each is raised
- * when its state changes, never for what was already so when the window opened.
+ * sight — a task ending, BRAIN's daily limit, a lost session, an update to install. The backend
+ * works out the first three and pushes them (`lib/notices.ts`), so a window hidden in the tray
+ * fetches nothing to hear of them.
  */
 
-import { useQuery } from '@tanstack/react-query'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { type ReactNode, useEffect, useRef, useState } from 'react'
-import { simulations } from '@/api/core'
 import { cn } from '@/lib/cn'
-import { useRefetchOn } from '@/lib/ws'
-import { labTasks } from '@/screens/tasks/api'
+import { onScreen, useNotices } from '@/lib/notices'
 import { useUpdateStatus } from './update'
 
 /** Tauri puts its bridge into the page it shows; a browser tab has none. */
@@ -130,12 +128,9 @@ export function WindowControls() {
   )
 }
 
-const ENDED: Record<string, string> = { COMPLETE: 'finished', PAUSED: 'paused', FAILED: 'failed' }
-const LIVE = new Set(['QUEUED', 'RUNNING'])
-
 async function notify(title: string, body: string) {
   // What is on screen already says it.
-  if (document.visibilityState === 'visible' && document.hasFocus()) return
+  if (onScreen()) return
   // Asked once, on mount: a prompt raised from the tray is held back or unwelcome.
   const { isPermissionGranted, sendNotification } = await import('@tauri-apps/plugin-notification')
   if (!(await isPermissionGranted())) return
@@ -143,13 +138,8 @@ async function notify(title: string, body: string) {
 }
 
 export function DesktopNotifications() {
-  // The same queries the Tasks page and the header read, so this costs nothing extra on screen.
-  const tasks = useQuery({ queryKey: ['lab-tasks'], queryFn: labTasks.list })
-  // Kept refetching while the window is in the tray, which is when a notice matters, but at a
-  // pace that costs nothing: a task's end is announced within half a minute.
-  useRefetchOn('studies', ['lab-tasks'], 2_000, 30_000)
-  const engine = useQuery({ queryKey: ['simulations', 'engine'], queryFn: simulations.engine })
-  useRefetchOn('simulations', ['simulations', 'engine'], 2_000, 30_000)
+  // Tasks ending, the daily limit, a refused session: pushed by the backend as they happen.
+  useNotices((title, body) => void notify(title, body))
   const update = useUpdateStatus()
 
   // Asked now, while the window is in front: macOS may hold back a prompt raised from the tray.
@@ -158,48 +148,6 @@ export function DesktopNotifications() {
       if (!(await plugin.isPermissionGranted())) await plugin.requestPermission()
     })
   }, [])
-
-  const statuses = useRef<Map<number, string> | null>(null)
-  useEffect(() => {
-    const list = tasks.data?.tasks
-    if (!list) return
-    const before = statuses.current
-    statuses.current = new Map(list.map((t) => [t.id, t.status]))
-    if (!before) return
-    // A task new since the last look may have started and ended between two of them.
-    const ended = list.filter(
-      (task) => ENDED[task.status] && (!before.has(task.id) || LIVE.has(before.get(task.id) ?? '')),
-    )
-    const name = (task: (typeof list)[number]) => task.name || task.templateName || task.labName
-    const [only] = ended
-    if (ended.length === 1 && only) {
-      void notify(`${name(only)} ${ENDED[only.status]}`, only.message || only.labName)
-    } else if (ended.length > 1) {
-      // One notice for a batch, as when several tasks end in the same moment.
-      const shown = ended.slice(0, 3).map((t) => `${name(t)} ${ENDED[t.status]}`)
-      const more = ended.length > 3 ? `, and ${ended.length - 3} more` : ''
-      void notify(`${ended.length} tasks ended`, `${shown.join(', ')}${more}.`)
-    }
-  }, [tasks.data])
-
-  const flags = useRef<{ limit: boolean; session: boolean } | null>(null)
-  useEffect(() => {
-    if (!engine.data) return
-    const now = { limit: engine.data.dailyLimitHit, session: engine.data.sessionLost }
-    const before = flags.current
-    flags.current = now
-    if (!before) return
-    if (now.limit && !before.limit)
-      void notify(
-        "BRAIN's daily simulation limit is reached",
-        'Queued simulations wait for the reset at midnight US Eastern.',
-      )
-    if (now.session && !before.session)
-      void notify(
-        'BRAIN is not accepting your session',
-        'Sending is paused until the session is renewed or you sign in again.',
-      )
-  }, [engine.data])
 
   const offered = useRef<string | null | undefined>(undefined)
   useEffect(() => {

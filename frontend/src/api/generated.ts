@@ -1542,6 +1542,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/resources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Usage */
+        get: operations["usage_api_resources_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/search-lab/options": {
         parameters: {
             query?: never;
@@ -4541,6 +4558,41 @@ export interface components {
             settings?: {
                 [key: string]: unknown;
             };
+        };
+        /**
+         * ResourceUsage
+         * @description Totals since the backend started. The panel works out rates from two readings.
+         */
+        ResourceUsage: {
+            /**
+             * Awake
+             * @enum {string}
+             */
+            awake: "held" | "idle" | "unavailable";
+            /** Computecpuseconds */
+            computeCpuSeconds: number;
+            /**
+             * Computepriority
+             * @enum {string}
+             */
+            computePriority: "idle" | "lowered" | "refused" | "unchanged" | "pending";
+            /** Computethreads */
+            computeThreads: number | null;
+            /** Cpus */
+            cpus: number;
+            /** Duckdbthreads */
+            duckdbThreads: number | null;
+            /** Maththreads */
+            mathThreads: number | null;
+            /** Nice */
+            nice: number | null;
+            /** Processcpuseconds */
+            processCpuSeconds: number;
+            profile: components["schemas"]["Profile"];
+            /** Readat */
+            readAt: number;
+            /** Uptimeseconds */
+            uptimeSeconds: number;
         };
         /** SampleAlpha */
         SampleAlpha: {
@@ -8061,6 +8113,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Quitting"];
+                };
+            };
+        };
+    };
+    usage_api_resources_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResourceUsage"];
                 };
             };
         };

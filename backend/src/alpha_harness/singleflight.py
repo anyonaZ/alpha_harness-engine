@@ -51,3 +51,32 @@ class SingleFlight:
                 if self._runs.get(key) is entry:
                     del self._runs[key]
                 future.cancel()
+
+
+class Kept:
+    """The last few answers, each kept while the data it was read from is unchanged.
+
+    ``version`` is the data's write count (``Catalog.version``), read before the answer is
+    worked out, so a write landing during the run makes it stale at once. A refresh after a
+    run has ended, the Portfolio page coming back into view, a second tab: none of them
+    recompute while nothing was written.
+    """
+
+    def __init__(self, size: int = 8) -> None:
+        self._size = size
+        self._answers: dict[Hashable, tuple[int, Any]] = {}
+        self._flights = SingleFlight()
+
+    async def get[T](
+        self, key: Hashable, version: Callable[[], int], make: Callable[[], Awaitable[T]]
+    ) -> T:
+        at = version()
+        kept = self._answers.get(key)
+        if kept is not None and kept[0] == at:
+            return kept[1]
+        answer = await self._flights.run((key, at), make)
+        self._answers.pop(key, None)
+        self._answers[key] = (at, answer)
+        while len(self._answers) > self._size:
+            del self._answers[next(iter(self._answers))]
+        return answer

@@ -127,7 +127,7 @@ def refill(
             seen[key] = float(r["values"][0]) if r["state"] == "COMPLETE" else False
     before = len(built.get_trials(deepcopy=False))
     cpu = time.thread_time()
-    picked, _ = scheduler.ask_points(
+    picked, _, _ = scheduler.ask_points(
         built,
         search,
         RUN(space),
