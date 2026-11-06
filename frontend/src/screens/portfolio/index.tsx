@@ -14,6 +14,7 @@ import { REGION_AGNOSTIC_CLASS } from '@/api/platform'
 import { cn } from '@/lib/cn'
 import { CORE_METRICS, CORE_ORDER, DASH, fmt } from '@/lib/format'
 import { useLive } from '@/lib/live'
+import { usePreferences, useSavePreferences } from '@/lib/preferences'
 import { useDebounced } from '@/lib/use-debounced'
 import {
   AlphaTable,
@@ -198,6 +199,54 @@ function SyncButton() {
   )
 }
 
+/** How long a figure may take on the Lean profile before the page says why. */
+const SLOW_MS = 3000
+
+/** True once ``busy`` has lasted ``ms`` without a break; false again as soon as it ends. */
+function useLasting(busy: boolean, ms: number): boolean {
+  const [lasting, setLasting] = useState(false)
+  useEffect(() => {
+    if (!busy) {
+      setLasting(false)
+      return
+    }
+    const timer = setTimeout(() => setLasting(true), ms)
+    return () => clearTimeout(timer)
+  }, [busy, ms])
+  return lasting
+}
+
+/**
+ * On the Lean profile Portfolio's arithmetic gets one thread at the lowest priority, so a big
+ * selection takes a while. Said only when a figure is slow in coming, with the way out. The
+ * thread count is set at start, so the switch speeds up the next start, not this page.
+ */
+function LeanProfileHint({ slow }: { slow: boolean }) {
+  const prefs = usePreferences()
+  const save = useSavePreferences()
+  const current = prefs.data
+  if (!slow || current?.resourceProfile !== 'lean') return null
+  return (
+    <Notice
+      tone="info"
+      title="Portfolio runs on one thread on the Lean profile"
+      action={
+        <Button
+          size="sm"
+          loading={save.isPending}
+          onClick={() => save.mutate({ ...current, resourceProfile: 'balanced' })}
+        >
+          Use Balanced
+        </Button>
+      }
+    >
+      Lean keeps the app's arithmetic to one thread at the lowest priority, so large selections take
+      longer here. Balanced uses two, from the next time the app starts. BRAIN simulates just as
+      fast in either.
+    </Notice>
+  )
+}
+
 export function PortfolioScreen() {
   const netNow = useNetBps(VIEW)
   const charged = useDebounced(netNow, 400)
@@ -277,6 +326,7 @@ export function PortfolioScreen() {
   const membersStale = members.isPlaceholderData || netNow !== charged
   const combinedStale = computed.isPlaceholderData || costNow !== cost
   const syncing = useSyncTask() !== undefined
+  const slow = useLasting(members.isFetching || (ids.length > 0 && computed.isFetching), SLOW_MS)
 
   return (
     <Page>
@@ -284,6 +334,7 @@ export function PortfolioScreen() {
       <SyncProgress />
       {members.error ? <ErrorNotice error={members.error} /> : null}
       {computed.error ? <ErrorNotice error={computed.error} /> : null}
+      <LeanProfileHint slow={slow} />
       {unlabelled > 0 && (
         <Notice tone="warn" title="Classifications and pyramids not read yet">
           Sync from BRAIN to read them for {unlabelled} SUBMITTED Alpha

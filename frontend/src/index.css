@@ -224,6 +224,16 @@
     }
   }
 
+  /* Loading placeholders: five slow pulses, ten seconds, then still. A load that takes longer
+     is waiting on something (BRAIN, a sync), and a pulse that never stops repaints its region
+     for as long as the screen is open. */
+  --animate-skeleton: skeleton 2s cubic-bezier(0.4, 0, 0.6, 1) 5;
+  @keyframes skeleton {
+    50% {
+      opacity: 0.5;
+    }
+  }
+
   --font-sans: "Inter Variable", Inter, -apple-system, system-ui, sans-serif;
   --font-mono: "JetBrains Mono Variable", "JetBrains Mono", "Geist Mono", SFMono-Regular, monospace;
 

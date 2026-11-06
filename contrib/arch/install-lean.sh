@@ -35,4 +35,4 @@ systemctl --user enable --now alpha-harness
 
 echo
 echo "Alpha Harness Lean is running. Open http://localhost:8000"
-echo "Change the Resource profile under Settings > Simulations."
+echo "Change the Resource profile under Settings > Resources."

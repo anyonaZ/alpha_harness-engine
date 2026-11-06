@@ -708,11 +708,12 @@ export function Spinner({ className }: { className?: string }) {
   )
 }
 
-/** A placeholder shape. Give one `label` per loading region so screen readers hear it too. */
+/** A placeholder shape, pulsing for its first ten seconds. Give one `label` per loading region
+ * so screen readers hear it too. */
 export function Skeleton({ className, label }: { className?: string; label?: string }) {
   return (
     <>
-      <div aria-hidden className={cn('animate-pulse rounded-md bg-surface-2', className)} />
+      <div aria-hidden className={cn('animate-skeleton rounded-md bg-surface-2', className)} />
       {label && (
         <span role="status" className="sr-only">
           {label}
