@@ -4,7 +4,10 @@ A fork of Alpha Harness `v2026.10.24.1` that keeps every lab, tool and screen bu
 app's own CPU cost from growing with how long a task has run. BRAIN throughput is unchanged:
 eight slots, batches of ten, the same submission and recovery rules.
 
-Version: `2026.10.24.1+lean3`. The `+lean` label makes the updater report new upstream
+Upstream base: v2026.10.24.1 (the upstream release this fork is built on; update this line
+when one is brought in, since the weekly upstream check compares from it).
+
+Version: `2026.10.24.1+lean7`. The `+lean` label makes the updater report new upstream
 releases without installing them by itself, since an upstream build would undo these changes.
 
 ## What changed
@@ -206,6 +209,14 @@ Settings → Resources has a **By hour** row: one bar per clock hour over the la
 hour so far with the sampler's part (`usage.py`, read every five minutes; `hours` in
 `GET /api/resources`). The plan asked for this so the budget can be checked without
 watching the panel.
+
+## Phase 7: the plan's last UI items
+
+| Item | Before | Lean |
+| --- | --- | --- |
+| Closing the window | Hid it to the tray without a word: on a desktop that shows no tray icon, the app looked closed while tasks kept simulating | The first close says the app is still running, with **Keep running** and **Quit** (`desktop/src-tauri/src/main.rs`, once per install) |
+| Loading placeholders | Pulsed for as long as a load took | Five slow pulses, ten seconds, then still (`animate-skeleton`); a progress bar of unknown length and "Reconnecting…" still pulse, as they mean work is going on |
+| Portfolio on the Lean profile | Large selections were slow with no reason given | When a figure takes over three seconds on Lean, a note says why and offers **Use Balanced** (from the next start, when thread counts are set) |
 
 ## Resource profiles
 

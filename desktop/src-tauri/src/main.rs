@@ -14,6 +14,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::webview::NewWindowResponse;
 use tauri::{AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 /// The step the supervisor is on, for a start-up page that loads after it was announced.
 #[derive(Default)]
@@ -93,6 +94,40 @@ pub fn show(app: &AppHandle) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+/// Said once, the first time the window is closed: the window went, the app did not. Without
+/// it a closed window looks like a closed app, and a tray icon is easy to miss (some Linux
+/// desktops show none without an extension). Remembered by a file beside the app's own, so an
+/// update does not say it again.
+fn tray_notice(app: &AppHandle) {
+    let marker = supervisor::home().join("tray-notice-shown");
+    if marker.exists() {
+        return;
+    }
+    let written =
+        std::fs::create_dir_all(supervisor::home()).and_then(|()| std::fs::write(&marker, b""));
+    if let Err(error) = written {
+        supervisor::note(&format!("could not remember the tray notice: {error}"));
+    }
+    let handle = app.clone();
+    app.dialog()
+        .message(
+            "Alpha Harness is still running, so your tasks keep simulating on BRAIN.\n\n\
+             Open it again from its tray icon. To stop it, choose Quit Alpha Harness from the \
+             tray icon's menu, or Quit here.",
+        )
+        .title("Alpha Harness is still running")
+        .kind(MessageDialogKind::Info)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Keep running".into(),
+            "Quit".into(),
+        ))
+        .show(move |keep| {
+            if !keep {
+                supervisor::quit(&handle);
+            }
+        });
 }
 
 fn tray(app: &AppHandle) -> tauri::Result<()> {
@@ -177,6 +212,7 @@ fn main() {
             {
                 api.prevent_close();
                 let _ = window.hide();
+                tray_notice(window.app_handle());
             }
         })
         .build(tauri::generate_context!())
