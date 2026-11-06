@@ -5,6 +5,9 @@ Starts ``fake_brain.py``, seeds a fresh data folder with a Search Lab task that 
 ``--minutes`` and reads the backend's CPU from ``/proc`` each minute. Reports CPU as a share of
 one core, and per thousand simulations, so builds that finish different amounts compare fairly.
 
+``--watch`` keeps the app's live socket open throughout, as an open window does: the backend
+then has a screen to push the running simulations to. Without it the run is a closed window.
+
 The backend is pointed at the stand-in by a small launcher that sets ``API_BASE`` in memory
 before the app is imported: the app itself has no setting that redirects it, on purpose.
 
@@ -19,6 +22,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -64,6 +68,19 @@ def maths(app_url: str) -> float | None:
         return None
 
 
+def watch(app_url: str, received: list[int]) -> None:
+    """Hold the live socket open and read what it sends, as the app's window does."""
+    from websockets.sync.client import connect
+
+    uri = app_url.replace("http://", "ws://") + "/ws"
+    try:
+        with connect(uri, origin="http://localhost:8000", open_timeout=10) as socket:  # pyright: ignore[reportArgumentType]
+            for _ in socket:
+                received[0] += 1
+    except Exception:  # noqa: BLE001 - the app stopping ends the watch
+        return
+
+
 def wait_for(url: str) -> None:
     for _ in range(240):
         try:
@@ -84,6 +101,7 @@ def main() -> None:
     parser.add_argument("--profile", default="balanced")
     parser.add_argument("--port", type=int, default=8797)
     parser.add_argument("--brain-port", type=int, default=8899)
+    parser.add_argument("--watch", action="store_true", help="hold the live socket open")
     args = parser.parse_args()
     backend = Path(args.backend).resolve()
     python = str(backend / ".venv" / "bin" / "python")
@@ -124,6 +142,9 @@ def main() -> None:
         try:
             wait_for(f"{brain_url}/__stats")
             wait_for(f"{app_url}/api/health")
+            received = [0]
+            if args.watch:
+                threading.Thread(target=watch, args=(app_url, received), daemon=True).start()
             get(f"{app_url}/api/lab-tasks/run-all", method="POST")
             start_cpu, start_at = cpu_seconds(app.pid), time.monotonic()
             last_cpu, last_sims = start_cpu, 0
@@ -132,6 +153,7 @@ def main() -> None:
             print(
                 f"{backend.parent.name}: {args.seed_trials} trials seeded, "
                 f"{args.sim_seconds:.0f} s simulations, profile {args.profile}"
+                + (", window open" if args.watch else "")
             )
             print(f"{'minute':>6} {'CPU':>9} {'maths':>9} {'sims':>6}")
             for minute in range(1, int(args.minutes) + 1):
@@ -169,6 +191,8 @@ def main() -> None:
         f"{last_sims} simulations, "
         f"{spent / max(last_sims, 1) * 1000:.0f} CPU-s per 1,000"
     )
+    if args.watch:
+        print(f"live messages received: {received[0]}")
     if stats.get("unknown"):
         print("not answered by the stand-in:", stats["unknown"])
 

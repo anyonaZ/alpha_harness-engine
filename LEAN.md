@@ -11,7 +11,7 @@ releases without installing them by itself, since an upstream build would undo t
 
 | Area | Before | Lean |
 | --- | --- | --- |
-| Search / Template Lab sampler | TPE replayed every trial on every ask; cost grew with the task | Replays the best 500 and latest 1,500 trials (profile-set); a study past 4,000 in memory is rebuilt from that window |
+| Search / Template Lab sampler | TPE replayed every trial on every ask; cost grew with the task | Replays the best 500 and latest 1,500 trials (profile-set); a study past 2,500 in memory (Max: 6,000) is rebuilt from that window |
 | Sampler time per refill | Up to `want × 5` asks, no limit | A CPU budget per refill (1 s Lean, 2 s Balanced, 5 s Max); the rest of the round is drawn uniformly from untried points as fixed trials the sampler still learns from |
 | Evolution Lab | Read and decoded every child's score every 5 s, even with nothing to breed | Returns at once when there is nothing to breed or finish; the stall verdict is cached until another child is spent |
 | Power Pool Lab | Loaded every proposed trial every 5 s | Counts them; loads only the ones it sends |
@@ -68,6 +68,58 @@ Not done as first planned, and why:
 both for the same points and fails on the first difference: identical over 2,000 and 4,000
 trials with 1,500 fields and 1,500 trials with 60, at 21% to 32% less CPU per ask.
 
+## Phase 5: flat under busy load
+
+Phase 4's busy benchmark showed CPU still rising over a long task: the in-memory study grew
+from its 2,000-trial window towards the 4,000-trial rebuild ceiling, and each ask costs more
+with every trial held.
+
+| Area | Before | Lean |
+| --- | --- | --- |
+| TPE trial split | With `group=True`, each ask split the same trials into good and bad once per parameter group (six times on a Search Lab task) | Remembered for the groups of one ask (`labs/tpe_speed.py`); the same trials and count give the same split |
+| Rebuild ceiling | 4,000 trials (Max 10,000) | 2,500 (Max 6,000): window + 500. An ask costs about 12 µs per trial held and a rebuild about 1.5 s, so this margin costs least in all |
+| Tracker poll round | Loaded every pending or running row whole, request bodies included, several times a second | Reads the five columns it needs; a row is loaded whole when it finishes |
+| Live push of running simulations | Read and serialised every active row once a second whether or not a screen was open | Skipped with no screen open; a screen that connects gets a fresh snapshot (`Hub.provide`) |
+
+`bench/tpe_equivalence.py` is still identical (3,000 trials, 120 asks), now 52% less CPU per
+ask than Optuna as shipped. One ask: 32 ms at 2,000 trials held, 57 ms at 4,000 (Phase 4: 37
+and 70).
+
+### Busy load
+
+`bench/busy_bench.py`, with a Search Lab task seeded with 10,000 trials and 1,500 fields, eight
+slots busy, against the BRAIN stand-in (`bench/fake_brain.py`), Balanced. CPU is a share of
+one core; "sampler" is the compute pool's part of it.
+
+60 s simulations (about BRAIN's pace; 80 a minute with eight slots of ten):
+
+| Build | Minutes | CPU | Last 5 min | Sampler | Simulations | CPU-s per 1,000 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Upstream v2026.10.24.1 | 20 | 33.9%, in bursts of 50–57% | 33.0% | – | 960 (slots empty one minute in three) | 424 |
+| Lean, Phase 4 | 20 | 16.1%, rising 8% → 20% | 19.5% | 12% at the end | 1,520 | 127 |
+| Lean, Phase 5 | 30 | 12.0%, flat from minute 6 | 13.4% | 5–7% | 2,320 | 93 |
+| Lean, Phase 5, window open | 30 | 13.1%, flat from minute 6 | 14.2% | 5–7% | 2,320 | 102 |
+
+20 s simulations (three times BRAIN's pace, a stress test):
+
+| Build | Minutes | CPU | Last 5 min | Simulations | CPU-s per 1,000 |
+| --- | --- | --- | --- | --- | --- |
+| Upstream v2026.10.24.1 | 10 | 64.6% | 70.8% | 960 | 404 |
+| Lean, Phase 4 | 10 | 41.5%, rising 22% → 54% | 48.7% | 2,160 | 116 |
+| Lean, Phase 5, window open | 10 | 31.1%, flat from minute 3 | 33.5% | 2,200 | 85 |
+
+The plan's target was under 10% of a core at a steady 80 simulations a minute. Phase 5
+holds 12–13%. What remains is about half sampler (one TPE ask per simulation, at roughly
+35 ms each) and half the work itself: about three status reads a second, a whole Alpha and
+its PnL and turnover downloaded for each simulation, and the progress writes the screens
+show. The flat line is the point: it no longer grows with the task's age. At a slower
+pace the sampler's half shrinks with it, since it asks once per simulation finished.
+
+```sh
+backend/.venv/bin/python bench/busy_bench.py --backend backend --minutes 30 --sim-seconds 60
+backend/.venv/bin/python bench/busy_bench.py --backend backend --minutes 30 --sim-seconds 60 --watch
+```
+
 ## Resource profiles
 
 Settings → Simulations → **Resource profile**. Threads and CPU priority take effect at the next
@@ -84,6 +136,7 @@ the environment is the default when nothing was chosen there.
 | Sampler budget per refill | 1 s | 2 s | 5 s |
 | Sampler share of a core, on average | 20% | 40% | no limit |
 | Sampler history (best + latest) | 500 + 1,500 | 500 + 1,500 | 1,000 + 4,000 |
+| Study rebuilt past | 2,500 trials | 2,500 trials | 6,000 trials |
 | Keep-awake | sleep only, on mains | sleep only, on mains | sleep and idle, always |
 | UI motion | reduced | normal | normal |
 

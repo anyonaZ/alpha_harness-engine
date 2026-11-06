@@ -94,7 +94,9 @@ class AppState:
             on_change=self._simulations_changed,
             on_unauthorized=self.renew_session,
             on_alpha=self.backfill.capture,
+            listening=lambda: self.hub.client_count > 0,
         )
+        self.hub.provide(TOPIC_SIMULATIONS, self.tracker.snapshot)
         self.engine = BatchEngine(
             self.db, self.endpoints, self.tracker, on_unauthorized=self.renew_session
         )
@@ -133,7 +135,9 @@ class AppState:
         self._restore_pending = False
 
     async def _simulations_changed(self, payload: Any) -> None:
-        await self.hub.broadcast(TOPIC_SIMULATIONS, payload)
+        # ``None``: no screen is open to show it (``SimulationTracker.snapshot``).
+        if payload is not None:
+            await self.hub.broadcast(TOPIC_SIMULATIONS, payload)
         await self.notices.engine_changed()
 
     async def _studies_changed(self, payload: Any) -> None:
