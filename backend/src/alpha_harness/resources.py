@@ -62,9 +62,15 @@ class Budget:
     #: Trials the sampler learns from: the best and the most recent. ``None`` is every trial.
     sampler_best: int | None
     sampler_recent: int | None
+    #: And an even sample of this many of the rest (``0``: none), so the sampler keeps a
+    #: thin record of what was tried and found poor long ago. Off in every profile: in
+    #: ``bench/quality_replay.py`` it helped a long task and cost a new one (Phase 6,
+    #: ``LEAN.md``); the plain window passed both.
+    sampler_spread: int
     #: A study held in memory past this many trials is rebuilt from the window above. Each
     #: ask costs about 12 µs per trial held and a rebuild about a second and a half, so a
     #: margin of some 500 over the window spends least in all (Phase 5, ``LEAN.md``).
+
     sampler_rebuild_at: int | None
     #: What the keep-awake lock blocks: ``sleep`` leaves screen blanking alone.
     awake_what: str
@@ -83,6 +89,7 @@ BUDGETS: dict[Profile, Budget] = {
         sampler_share=0.2,
         sampler_best=500,
         sampler_recent=1500,
+        sampler_spread=0,
         sampler_rebuild_at=2500,
         awake_what="sleep",
         awake_on_battery=False,
@@ -97,6 +104,7 @@ BUDGETS: dict[Profile, Budget] = {
         sampler_share=0.4,
         sampler_best=500,
         sampler_recent=1500,
+        sampler_spread=0,
         sampler_rebuild_at=2500,
         awake_what="sleep",
         awake_on_battery=False,
@@ -111,6 +119,7 @@ BUDGETS: dict[Profile, Budget] = {
         sampler_share=None,
         sampler_best=1000,
         sampler_recent=4000,
+        sampler_spread=0,
         sampler_rebuild_at=6000,
         awake_what="sleep:idle",
         awake_on_battery=True,

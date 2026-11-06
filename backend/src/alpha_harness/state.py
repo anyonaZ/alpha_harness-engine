@@ -15,7 +15,7 @@ from typing import Any
 import structlog
 from sqlalchemy import select
 
-from . import compute, events, preferences, resources, updates
+from . import compute, events, preferences, resources, updates, usage
 from .account import AuthService, PlatformMetadata
 from .brain.client import BrainClient
 from .brain.endpoints import BrainEndpoints
@@ -211,6 +211,7 @@ class AppState:
         await self.tracker.start()
         await self.engine.start()
         await self.optimizer.start()
+        usage.history.start()
         self._session_watch = asyncio.create_task(self._watch_session(), name="session-watch")
         log.info("startup.complete", data_dir=str(self.settings.data_dir))
 
@@ -328,6 +329,7 @@ class AppState:
             watch.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await watch
+        await usage.history.stop()
         await self.optimizer.stop()
         await self.engine.stop()
         await self.tracker.stop()

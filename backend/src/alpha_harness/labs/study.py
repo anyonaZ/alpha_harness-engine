@@ -498,6 +498,15 @@ class Optimizer:
             log.info("optimize.rebuild", study_id=study_id, trials=ceiling)
 
         async with self.db.session() as session:
+            spread_stride = 0
+            if budget.sampler_spread:
+                replayed = await session.scalar(
+                    select(func.count()).where(
+                        Trial.study_id == study_id, Trial.state.in_(REPLAYED)
+                    )
+                )
+                older = max(0, int(replayed or 0) - (budget.sampler_recent or 0))
+                spread_stride = max(1, -(-older // budget.sampler_spread))
             history = [
                 {
                     "params": params or {},
@@ -510,7 +519,12 @@ class Optimizer:
                         select(Trial.params, Trial.distributions, Trial.values, Trial.state)
                         .where(
                             Trial.study_id == study_id,
-                            *history_window(study_id, budget.sampler_best, budget.sampler_recent),
+                            *history_window(
+                                study_id,
+                                budget.sampler_best,
+                                budget.sampler_recent,
+                                spread_stride,
+                            ),
                         )
                         .order_by(Trial.number)
                     )
@@ -583,9 +597,13 @@ def make_sampler(n_startup_trials: int, batch_size: int, seed: int | None = None
     )
 
 
-def history_window(study_id: int, best: int | None, recent: int | None) -> list[Any]:
-    """SQL conditions keeping a task's best ``best`` scored trials and its ``recent`` most
-    recent replayable ones; none when both are ``None``, which keeps every trial."""
+def history_window(
+    study_id: int, best: int | None, recent: int | None, stride: int = 0
+) -> list[Any]:
+    """SQL conditions keeping a task's best ``best`` scored trials, its ``recent`` most
+    recent replayable ones, and with ``stride`` every stride-th trial besides: a thin, even
+    record of everything tried, so TPE still knows which regions were tried and found poor.
+    None when ``best`` and ``recent`` are both ``None``, which keeps every trial."""
     if best is None and recent is None:
         return []
     kept: list[Any] = []
@@ -605,6 +623,16 @@ def history_window(study_id: int, best: int | None, recent: int | None) -> list[
                 .where(Trial.study_id == study_id, Trial.state == TrialState.COMPLETE)
                 .order_by(func.json_extract(Trial.values, "$[0]").desc())
                 .limit(best)
+            )
+        )
+    if stride:
+        kept.append(
+            Trial.id.in_(
+                select(Trial.id).where(
+                    Trial.study_id == study_id,
+                    Trial.state.in_(REPLAYED),
+                    Trial.number % stride == 0,
+                )
             )
         )
     return [or_(*kept)]

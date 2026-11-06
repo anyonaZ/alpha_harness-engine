@@ -2,7 +2,9 @@
 
 Replays one synthetic Search Lab history into two seeded samplers, Optuna's as it comes and the
 app's, asks each for the same points (telling each the same scores back), and fails on the
-first point that differs. Also reports CPU per ask for both. Run from ``backend/``:
+first point that differs. Also reports CPU per ask for both, and with ``--max-ratio`` fails
+when the app's asks cost more than that share of Optuna's: the shortcuts quietly stopped
+applying. ``lefthook run check`` (and so CI) runs a small one. Run from ``backend/``:
 
     uv run python ../bench/tpe_equivalence.py --trials 3000 --asks 120
 """
@@ -57,6 +59,7 @@ def main() -> None:
     parser.add_argument("--trials", type=int, default=3000)
     parser.add_argument("--asks", type=int, default=120)
     parser.add_argument("--fields", type=int, default=1500)
+    parser.add_argument("--max-ratio", type=float, default=None)
     args = parser.parse_args()
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     space = make_space(args.fields)
@@ -76,6 +79,11 @@ def main() -> None:
         f"{plain_cost * 1000:.0f} ms per ask as Optuna ships, "
         f"{fast_cost * 1000:.0f} ms with the shortcuts"
     )
+    if args.max_ratio is not None and fast_cost > plain_cost * args.max_ratio:
+        raise SystemExit(
+            f"the shortcuts saved too little: {fast_cost / plain_cost:.0%} of Optuna's cost, "
+            f"more than {args.max_ratio:.0%}"
+        )
 
 
 if __name__ == "__main__":

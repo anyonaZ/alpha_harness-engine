@@ -3466,6 +3466,23 @@ export interface components {
             /** Websocketclients */
             websocketClients: number;
         };
+        /**
+         * HourUsage
+         * @description One clock hour of the last day.
+         */
+        HourUsage: {
+            /** Computecpuseconds */
+            computeCpuSeconds: number;
+            /** Cpuseconds */
+            cpuSeconds: number;
+            /** Seconds */
+            seconds: number;
+            /**
+             * Startedat
+             * Format: date-time
+             */
+            startedAt: string;
+        };
         /** KeyFailed */
         KeyFailed: {
             /** Error */
@@ -4582,6 +4599,8 @@ export interface components {
             cpus: number;
             /** Duckdbthreads */
             duckdbThreads: number | null;
+            /** Hours */
+            hours: components["schemas"]["HourUsage"][];
             /** Maththreads */
             mathThreads: number | null;
             /** Nice */

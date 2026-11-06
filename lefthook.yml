@@ -73,6 +73,13 @@ check:
     - name: launcher
       root: backend/
       run: uv run ruff check ../launcher && uv run ruff format --check ../launcher
+    # The benchmarks are code the Lean numbers rest on: linted like the rest, and the TPE
+    # shortcuts proved on every run to ask what Optuna asks, for less (``bench/``).
+    - name: bench
+      root: backend/
+      run: >-
+        uv run ruff check ../bench && uv run ruff format --check ../bench
+        && uv run python ../bench/tpe_equivalence.py --trials 1000 --asks 40 --max-ratio 0.85
     - name: frontend
       root: frontend/
       run: pnpm check

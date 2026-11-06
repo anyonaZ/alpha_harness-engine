@@ -299,6 +299,10 @@ function UsageRow() {
           <dd className="text-ink tabular-nums">
             {`${fmt.pct(average)} of one core on average over ${fmt.duration(now.uptimeSeconds)}; ${fmt.duration(now.processCpuSeconds)} of CPU in all`}
           </dd>
+          <dt className="text-ink-subtle">By hour</dt>
+          <dd>
+            <HourBars hours={now.hours} />
+          </dd>
           <dt className="text-ink-subtle">Maths threads</dt>
           <dd className="text-ink tabular-nums">
             {now.computeThreads === null
@@ -322,6 +326,48 @@ function UsageRow() {
         </dl>
       )}
     </SettingRow>
+  )
+}
+
+type HourUsage = ResourceUsage['hours'][number]
+
+const hourShare = (hour: HourUsage) => (hour.seconds > 0 ? hour.cpuSeconds / hour.seconds : 0)
+const hourLabel = (hour: HourUsage) =>
+  new Date(hour.startedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+
+/** CPU by clock hour over the last day, one bar an hour, tallest bar full height. */
+function HourBars({ hours }: { hours: HourUsage[] }) {
+  const latest = hours.at(-1)
+  if (!latest) return <span className="text-ink-subtle">Measuring…</span>
+  const tallest = Math.max(...hours.map(hourShare))
+  // A floor for the scale only, so an idle day draws short bars rather than full ones.
+  const top = Math.max(0.01, tallest)
+  const sampler = latest.cpuSeconds > 0 ? latest.computeCpuSeconds / latest.cpuSeconds : 0
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div
+        role="img"
+        aria-label={`CPU by hour over the last ${hours.length} hours; this hour so far ${fmt.pct(hourShare(latest))} of one core`}
+        className="flex h-12 items-end gap-0.5"
+      >
+        {hours.map((hour) => (
+          <div
+            key={hour.startedAt}
+            title={`From ${hourLabel(hour)}: ${fmt.pct(hourShare(hour))} of one core, ${fmt.duration(hour.cpuSeconds)} of CPU`}
+            className="flex h-full w-2 flex-col justify-end overflow-hidden rounded-sm bg-surface-2"
+          >
+            <div
+              className="w-full bg-primary"
+              style={{ height: `${(hourShare(hour) / top) * 100}%` }}
+            />
+          </div>
+        ))}
+      </div>
+      <span className="text-ink-subtle text-body-compact tabular-nums">
+        {`This hour so far: ${fmt.pct(hourShare(latest))} of one core, ${fmt.pct(sampler)} of that the sampler and Portfolio maths.`}
+        {hours.length > 1 && ` Busiest hour: ${fmt.pct(tallest)}.`}
+      </span>
+    </div>
   )
 }
 
