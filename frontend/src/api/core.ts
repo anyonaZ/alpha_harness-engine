@@ -29,6 +29,13 @@ export type SettingsOptions = Omit<Schemas['SettingsOptions'], 'fields'> & {
 /** What the Settings screen saves. */
 export type Preferences = Schemas['Preferences']
 
+/** What the backend has cost this computer since it started (Settings, Resources). */
+export type ResourceUsage = Schemas['ResourceUsage']
+
+export const resourceUsage = {
+  get: () => http.get<ResourceUsage>('/api/resources'),
+}
+
 export const preferences = {
   get: () => http.get<Preferences>('/api/preferences'),
   /** Replaces every choice; the engine applies it on its next round. */

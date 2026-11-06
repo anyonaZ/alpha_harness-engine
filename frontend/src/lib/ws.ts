@@ -7,7 +7,7 @@
 import { useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef } from 'react'
 
-export type Topic = 'simulations' | 'tasks' | 'sync' | 'studies' | 'session'
+export type Topic = 'simulations' | 'tasks' | 'sync' | 'studies' | 'session' | 'notices'
 
 type Handler = (payload: unknown) => void
 

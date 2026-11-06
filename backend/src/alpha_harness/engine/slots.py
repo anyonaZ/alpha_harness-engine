@@ -35,7 +35,7 @@ from ..brain.platform import MULTI_SIMULATION_SIZE, SIMULATION_SLOTS
 from ..brain.schemas import QUICK_MODE, SimulationRequest
 from ..db.models import ACTIVE, DedupEntry, SimStatus, SimulationRecord, Study, TaskQuota, utcnow
 from ..tasks import spawn
-from .awake import StayAwake
+from .awake import AwakeState, StayAwake
 from .lifecycle import (
     SLOT_COST,
     Outcome,
@@ -163,6 +163,10 @@ class BatchEngine:
             self._task = None
         self._awake.release()
         log.info("engine.stopped")
+
+    @property
+    def awake_state(self) -> AwakeState:
+        return self._awake.state
 
     def set_keep_awake(self, on: bool) -> None:
         """Turned off, the machine may sleep at once rather than at the next check."""
@@ -898,10 +902,21 @@ class BatchEngine:
         log.warning("engine.batch_failed", parent=parent_id, requeued=requeue, message=message)
         await self.tracker.notify()
 
+    @property
+    def daily_limit_hit(self) -> bool:
+        return self._daily_limit_hit
+
+    @property
+    def session_lost(self) -> bool:
+        return self._session_lost
+
     def _on_session_lost(self) -> None:
-        if not self._session_lost:
-            log.warning("engine.session_lost")
+        if self._session_lost:
+            return
+        log.warning("engine.session_lost")
         self._session_lost = True
+        # Pushed so the screens, and the notice for a hidden window, hear of it now.
+        spawn(self.tracker.notify(), name="session-lost-notify")
 
     async def _on_daily_limit(self) -> None:
         self._daily_limit_hit = True

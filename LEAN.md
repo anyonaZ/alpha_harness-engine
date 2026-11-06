@@ -4,7 +4,7 @@ A fork of Alpha Harness `v2026.10.24.1` that keeps every lab, tool and screen bu
 app's own CPU cost from growing with how long a task has run. BRAIN throughput is unchanged:
 eight slots, batches of ten, the same submission and recovery rules.
 
-Version: `2026.10.24.1+lean2`. The `+lean` label makes the updater report new upstream
+Version: `2026.10.24.1+lean3`. The `+lean` label makes the updater report new upstream
 releases without installing them by itself, since an upstream build would undo these changes.
 
 ## What changed
@@ -52,6 +52,22 @@ Not done as first planned, and why:
 - **A counters table** for the task list was not needed: Phase 1's cache recounts a task only
   when its counts by state change, which is exact and keeps repeat calls at about 40 ms.
 
+## Phase 4: busy load, notices, and a window into usage
+
+| Area | Before | Lean |
+| --- | --- | --- |
+| TPE group decomposition | Every finished trial merged into the parameter groups again on every ask | Each trial merged once (`labs/tpe_speed.py`); merging a set already merged changes nothing, so the groups are the same |
+| TPE category positions | `tuple.index` over the choice list for every trial on every ask (1,500 fields deep) | A lookup table per list, first match first, as `tuple.index` gives |
+| Sampler total | Bounded per refill only, so fast-returning batches could add up | Also a shared allowance: at most 20% (Lean) or 40% (Balanced) of a core on average, half a minute of burst; a round it cuts short is drawn uniformly and never mistaken for a used-up search |
+| Notifications | The desktop window fetched the task list and engine status every 30 s while hidden, to compare them itself | The backend compares on the changes it already pushes and sends only the news (`notices.py`, the `notices` topic); a hidden window fetches nothing |
+| Notifications in a browser | none | Settings → Tasks → Notify me in this browser, for the systemd service mode |
+| Portfolio | Recomputed on every refresh | Kept until the vault is next written to (`Catalog.version`), shared between concurrent requests |
+| Resources panel | none | Settings → Resources: the profile, CPU in the last 5 seconds and since start (and the sampler's part of it), threads, priority, keep-awake |
+
+`bench/tpe_equivalence.py` replays one history into Optuna's sampler and into the app's, asks
+both for the same points and fails on the first difference: identical over 2,000 and 4,000
+trials with 1,500 fields and 1,500 trials with 60, at 21% to 32% less CPU per ask.
+
 ## Resource profiles
 
 Settings → Simulations → **Resource profile**. Threads and CPU priority take effect at the next
@@ -66,6 +82,7 @@ the environment is the default when nothing was chosen there.
 | Worker threads | 2 | 4 | default |
 | Nice | 10 | 5 | 0 |
 | Sampler budget per refill | 1 s | 2 s | 5 s |
+| Sampler share of a core, on average | 20% | 40% | no limit |
 | Sampler history (best + latest) | 500 + 1,500 | 500 + 1,500 | 1,000 + 4,000 |
 | Keep-awake | sleep only, on mains | sleep only, on mains | sleep and idle, always |
 | UI motion | reduced | normal | normal |
@@ -113,7 +130,7 @@ uv run python ../bench/tasks_bench.py --tasks 4 --trials 100000
 
 ```sh
 sudo pacman -S uv nodejs pnpm
-git clone <this repository> alpha-harness && cd alpha-harness && git switch lean
+git clone https://github.com/anyonaZ/alpha_harness-engine && cd alpha_harness-engine
 sh contrib/arch/install-lean.sh
 ```
 
@@ -122,9 +139,13 @@ This builds the UI, installs the backend with `uv tool`, and enables a systemd u
 I/O priority and the Lean profile. Open <http://localhost:8000> in your browser. Run either
 the service or the desktop app, never both: they share `~/.alpha-harness`.
 
+In browser mode, turn on **Settings → Tasks → Notify me in this browser** to get the desktop
+app's notifications (a task ending, BRAIN's daily limit, a refused session) while the tab is
+in the background.
+
 ## Still to do
 
-- Desktop notifications sent by the backend, so a hidden window needs no queries at all.
-- A fake-BRAIN server for an hour-long end-to-end CPU test with simulations running.
-- Result caching for the Portfolio until the vault changes (single-flight shares runs that
-  overlap, but a refresh after one ends still recomputes).
+- A Resources history: today the panel shows the last five seconds and the average since
+  start, not a chart over the day.
+- Upstream pull requests to residual-lab/alpha-harness, one per change, if its maintainers
+  want them.

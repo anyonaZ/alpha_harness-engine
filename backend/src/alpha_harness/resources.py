@@ -56,6 +56,9 @@ class Budget:
     #: CPU seconds the sampler may spend on one refill before the rest of the round is drawn
     #: uniformly from points not tried yet. ``None`` is no limit, as shipped.
     sampler_seconds: float | None
+    #: Share of one core the sampler may average, over every task, however fast simulations
+    #: come back (``scheduler.SamplerAllowance``). ``None`` is no limit.
+    sampler_share: float | None
     #: Trials the sampler learns from: the best and the most recent. ``None`` is every trial.
     sampler_best: int | None
     sampler_recent: int | None
@@ -75,6 +78,7 @@ BUDGETS: dict[Profile, Budget] = {
         executor_workers=2,
         nice=10,
         sampler_seconds=1.0,
+        sampler_share=0.2,
         sampler_best=500,
         sampler_recent=1500,
         sampler_rebuild_at=4000,
@@ -88,6 +92,7 @@ BUDGETS: dict[Profile, Budget] = {
         executor_workers=4,
         nice=5,
         sampler_seconds=2.0,
+        sampler_share=0.4,
         sampler_best=500,
         sampler_recent=1500,
         sampler_rebuild_at=4000,
@@ -101,6 +106,7 @@ BUDGETS: dict[Profile, Budget] = {
         executor_workers=None,
         nice=0,
         sampler_seconds=5.0,
+        sampler_share=None,
         sampler_best=1000,
         sampler_recent=4000,
         sampler_rebuild_at=10000,

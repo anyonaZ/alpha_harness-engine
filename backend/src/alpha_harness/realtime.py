@@ -85,3 +85,5 @@ TOPIC_SYNC = "sync"
 TOPIC_SESSION = "session"
 TOPIC_STUDIES = "studies"
 TOPIC_TASKS = "tasks"
+#: News worth a system notification (``notices``). Never replayed: old news is not news.
+TOPIC_NOTICES = "notices"

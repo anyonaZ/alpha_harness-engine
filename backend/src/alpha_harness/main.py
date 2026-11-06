@@ -49,6 +49,7 @@ from .api import (
     vault,
     ws,
 )
+from .api import resources as resources_api
 from .api.auth import Session
 from .api.deps import install_exception_handlers
 from .api.update import stop_server
@@ -188,6 +189,7 @@ def create_app() -> FastAPI:
     app.include_router(competitions.router)
     app.include_router(update.router)
     app.include_router(preferences.router)
+    app.include_router(resources_api.router)
     app.include_router(ws.router)
 
     @app.get("/api/health", tags=["meta"])

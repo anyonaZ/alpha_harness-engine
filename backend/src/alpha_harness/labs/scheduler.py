@@ -9,6 +9,7 @@ import asyncio
 import functools
 import json
 import random
+import threading
 import time
 from dataclasses import dataclass
 from dataclasses import field as default
@@ -283,7 +284,7 @@ def ask_points(
     cover: list[str],
     schema: dict[str, Any] | None = None,
     budget_seconds: float | None = None,
-) -> tuple[list[tuple[Any, dict[str, Any], SimulationRequest]], str | None]:
+) -> tuple[list[tuple[Any, dict[str, Any], SimulationRequest]], str | None, bool]:
     """Ask for ``want`` new simulations. Runs off the event loop.
 
     A point this task already scored is answered with its score, one that failed is told as
@@ -295,6 +296,10 @@ def ask_points(
     study's whole history, so a round could cost minutes of a core. Past the budget the rest
     of the round is drawn uniformly from points not tried yet and handed to the study as
     fixed trials, which it records and learns from without sampling them.
+
+    Also says whether the search looks used up: asked in full, or drawn uniformly in full,
+    without finding a new point. A round cut short by its budget with nothing new is not
+    that, and the task waits for the next round rather than finishing.
 
     Also returns the first setting BRAIN refused, so a task left with nothing to ask can say
     whether BRAIN withdrew what it searches or the search ran out of new points.
@@ -313,10 +318,14 @@ def ask_points(
     started = time.thread_time()
 
     def spent() -> bool:
-        return budget_seconds is not None and time.thread_time() - started > budget_seconds
+        return budget_seconds is not None and time.thread_time() - started >= budget_seconds
 
+    cut_short = False
     for _ in range(want * 5):
-        if len(picked) >= want or spent():
+        if len(picked) >= want:
+            break
+        if spent():
+            cut_short = True
             break
         trial = study.ask()
         params, request = lab.draw(trial, run, choices)
@@ -349,9 +358,62 @@ def ask_points(
             continue
         keys.add(key)
         picked.append((trial, params, request))
-    if len(picked) < want and spent():
-        _fill_uniformly(study, lab, run, want, seen, schema, choices, picked, keys)
-    return picked, withdrawn
+    used_up = not cut_short
+    if len(picked) < want and cut_short:
+        used_up = _fill_uniformly(study, lab, run, want, seen, schema, choices, picked, keys)
+    return picked, withdrawn, used_up and not picked
+
+
+class SamplerAllowance:
+    """CPU the sampler may still spend, shared by every task in the process.
+
+    The per-refill budget alone does not bound the total: refills come each time a batch
+    returns, and with eight slots and fast simulations that is every few seconds. This is a
+    token bucket filled at the profile's share of one core and holding half a minute of it,
+    so the sampler averages no more than that share however quickly work comes back. A round
+    asked with nothing left is drawn uniformly, as a round past its own budget is.
+    """
+
+    #: Seconds of allowance the bucket holds: room for a burst, not for a long one.
+    WINDOW = 30.0
+
+    def __init__(self) -> None:
+        self._tokens: float | None = None
+        self._at = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _grant(self, budget: resources.Budget) -> float | None:
+        share = budget.sampler_share
+        with self._lock:
+            if share is None:
+                self._tokens = None
+                return budget.sampler_seconds
+            now = time.monotonic()
+            full = share * self.WINDOW
+            tokens = full if self._tokens is None else self._tokens
+            tokens = min(full, tokens + (now - self._at) * share)
+            self._tokens, self._at = tokens, now
+            allowed = max(0.0, tokens)
+            if budget.sampler_seconds is not None:
+                allowed = min(allowed, budget.sampler_seconds)
+            return allowed
+
+    def _spend(self, seconds: float) -> None:
+        with self._lock:
+            if self._tokens is not None:
+                self._tokens -= seconds
+
+    def ask(self, asking: Any, *args: Any) -> Any:
+        """``asking(*args, budget_seconds)``, on a compute thread, charged to the bucket."""
+        allowed = self._grant(resources.budget())
+        started = time.thread_time()
+        try:
+            return asking(*args, allowed)
+        finally:
+            self._spend(time.thread_time() - started)
+
+
+_allowance = SamplerAllowance()
 
 
 class _Recorder:
@@ -377,22 +439,24 @@ def _fill_uniformly(
     choices: Any,
     picked: list[tuple[Any, dict[str, Any], SimulationRequest]],
     keys: set[Any],
-) -> None:
+) -> bool:
     """Top ``picked`` up to ``want`` with uniform draws the task has not tried.
 
     Each draw is enqueued with every choice fixed, so ``study.ask`` neither samples it nor
     reads the history; the trial is a real one, told its score like any other. Stops early
     while the study holds trials someone else enqueued (the first pass's), which an ask
     would hand out instead and sample in part.
+
+    Returns whether every draw was tried: ``False`` when it stopped early for that reason.
     """
     from optuna.trial import TrialState as OptunaState
 
     rng = random.Random()
     for _ in range((want - len(picked)) * 20):
         if len(picked) >= want:
-            return
+            return True
         if study.get_trials(deepcopy=False, states=(OptunaState.WAITING,)):
-            return
+            return False
         recorder = _Recorder(rng)
         _, drawn = lab.draw(recorder, run, choices)
         if drawn is None:
@@ -412,6 +476,7 @@ def _fill_uniformly(
             continue
         keys.add(key)
         picked.append((trial, params, request))
+    return True
 
 
 async def advance(optimizer: Optimizer, study_id: int) -> int:
@@ -541,20 +606,13 @@ async def advance(optimizer: Optimizer, study_id: int) -> int:
 
     study = await optimizer.optuna_study(study_id, row, may_rebuild=True)
     schema = await optimizer.metadata.cached_settings_schema()
-    picked, withdrawn = await compute.run(
-        ask_points,
-        study,
-        lab,
-        run,
-        want,
-        seen,
-        cover,
-        schema,
-        resources.budget().sampler_seconds,
+    picked, withdrawn, used_up = await compute.run(
+        _allowance.ask, ask_points, study, lab, run, want, seen, cover, schema
     )
     if not picked:
-        # Nothing new left to ask: the task is done once what is out has come back.
-        if not waiting:
+        # Nothing new left to ask: the task is done once what is out has come back. A round
+        # the sampler's allowance cut short says nothing of the kind; the next round asks.
+        if used_up and not waiting:
             await finish(
                 optimizer,
                 study_id,

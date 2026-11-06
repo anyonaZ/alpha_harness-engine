@@ -11,6 +11,7 @@ import { today } from '@/api/core'
 import { errorMessage } from '@/api/http'
 import type { Today } from '@/api/types'
 import { useLive } from '@/lib/live'
+import { BrowserNotifications } from '@/lib/notices'
 import { usePreferences } from '@/lib/preferences'
 import { useRefetchOn } from '@/lib/ws'
 import { Button, Empty, LINK, Notice, Skeleton, Spinner } from '@/ui/kit'
@@ -131,7 +132,7 @@ function Workspace({ you }: { you: Today['you'] }) {
   return (
     <div className="flex h-svh flex-col">
       <Header />
-      {inDesktop && <DesktopNotifications />}
+      {inDesktop ? <DesktopNotifications /> : <BrowserNotifications />}
       <Group
         id="shell"
         orientation="horizontal"

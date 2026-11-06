@@ -34,7 +34,9 @@ from .labs.study import Optimizer
 from .llm.chat import ChatService
 from .llm.registry import ModelRegistry
 from .llm.service import LLMService
+from .notices import Notices
 from .realtime import (
+    TOPIC_NOTICES,
     TOPIC_SESSION,
     TOPIC_SIMULATIONS,
     TOPIC_STUDIES,
@@ -89,7 +91,7 @@ class AppState:
         self.tracker = SimulationTracker(
             self.db,
             self.endpoints,
-            on_change=lambda payload: self.hub.broadcast(TOPIC_SIMULATIONS, payload),
+            on_change=self._simulations_changed,
             on_unauthorized=self.renew_session,
             on_alpha=self.backfill.capture,
         )
@@ -113,17 +115,30 @@ class AppState:
             self.engine,
             self.endpoints,
             self.metadata,
-            on_change=lambda payload: self.hub.broadcast(TOPIC_STUDIES, payload),
+            on_change=self._studies_changed,
             alphas=self.alphas,
             backfill=self.backfill,
         )
         self.optimizer.llm = self.llm
+        self.notices = Notices(
+            self.db,
+            self.engine,
+            send=lambda payload: self.hub.broadcast(TOPIC_NOTICES, payload, replay=False),
+        )
 
         self._renew_lock = asyncio.Lock()
         self._last_session_check = float("-inf")
         self._last_login_attempt = float("-inf")
         #: Set when startup could not read the saved session: BRAIN or the network was down.
         self._restore_pending = False
+
+    async def _simulations_changed(self, payload: Any) -> None:
+        await self.hub.broadcast(TOPIC_SIMULATIONS, payload)
+        await self.notices.engine_changed()
+
+    async def _studies_changed(self, payload: Any) -> None:
+        await self.hub.broadcast(TOPIC_STUDIES, payload)
+        await self.notices.tasks_changed()
 
     async def _alpha_stored(self, payload: dict[str, Any]) -> None:
         # A trial waiting on this Alpha can be scored now.
@@ -186,6 +201,9 @@ class AppState:
         except Exception:
             log.warning("startup.recapture_failed", exc_info=True)
 
+        # What is so now is the baseline: a notice is news of a change from here on.
+        await self.notices.tasks_changed()
+        await self.notices.engine_changed()
         await self.tracker.start()
         await self.engine.start()
         await self.optimizer.start()

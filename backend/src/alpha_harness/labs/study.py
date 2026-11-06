@@ -40,7 +40,7 @@ from ..db.models import (
 )
 from ..vault.yields import checks_of, clean, gating_results, limits_of, verdict
 from . import objectives as obj
-from . import scheduler
+from . import scheduler, tpe_speed
 from .objectives import StudyNotFoundError
 from .params import SEARCH_SAMPLER, TASK_SAMPLERS, TEMPLATE_SAMPLER, SearchParams, params_of
 
@@ -567,15 +567,19 @@ class Optimizer:
 REPLAYED = (TrialState.COMPLETE, TrialState.FAIL, TrialState.PRUNED)
 
 
-def make_sampler(n_startup_trials: int, batch_size: int) -> Any:
-    """The Search and Template Labs' sampler, as it has always been configured."""
+def make_sampler(n_startup_trials: int, batch_size: int, seed: int | None = None) -> Any:
+    """The Search and Template Labs' sampler, as it has always been configured, with the
+    shortcuts in :mod:`.tpe_speed` (same answers, less work per ask)."""
     from optuna.samplers import TPESampler
 
-    return TPESampler(
-        n_startup_trials=n_startup_trials,
-        multivariate=True,
-        group=True,
-        constant_liar=batch_size > 1,
+    return tpe_speed.speed_up(
+        TPESampler(
+            n_startup_trials=n_startup_trials,
+            multivariate=True,
+            group=True,
+            constant_liar=batch_size > 1,
+            seed=seed,
+        )
     )
 
 

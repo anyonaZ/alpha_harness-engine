@@ -412,6 +412,8 @@ class Catalog:
         self.path = path
         self._conn: duckdb.DuckDBPyConnection | None = None
         self._lock = asyncio.Lock()
+        #: Counts writes: a result computed at one version is current while it holds.
+        self.version = 0
         #: Reads in flight. Futures rather than a count: a cancelled caller does not stop
         #: its thread, and ``close`` must wait for the thread, not the caller.
         self._reads: set[asyncio.Future[Any]] = set()
@@ -530,6 +532,8 @@ class Catalog:
         be released while the thread holds the non-thread-safe connection.
         """
         async with self._lock:
+            # Every write passes here: a result read before it is now stale (``version``).
+            self.version += 1
             work = asyncio.ensure_future(asyncio.to_thread(fn, *args))
             try:
                 return await asyncio.shield(work)
